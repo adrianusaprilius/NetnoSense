@@ -7,3 +7,5 @@ openpyxl
 scikit-learn
 requests
 wordcloud
+
+Sastrawi==1.0.1
