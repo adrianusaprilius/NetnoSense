@@ -65,7 +65,7 @@ def collect(platform, url, credential, limit, order='time'):
                 if ident in seen: continue
                 seen.add(ident)
                 text=redact(x.get('textOriginal',x.get('textDisplay',x.get('text',''))))
-                rows.append({'Komentar':text,'Video_ID':vid,'Likes':x.get('likeCount',x.get('like_count',0)),'Waktu_komentar':str(x.get('publishedAt',x.get('create_time',''))),'Waktu_koleksi_UTC':stamp,'Metode_koleksi':platform+' API / komentar utama / '+(order if platform=='YouTube' else 'urutan API')})
+                rows.append({'ID_Sumber':hashlib.sha256((platform+'|'+vid+'|'+str(ident)).encode()).hexdigest(), 'Komentar':text,'Video_ID':vid,'Likes':x.get('likeCount',x.get('like_count',0)),'Waktu_komentar':str(x.get('publishedAt',x.get('create_time',''))),'Waktu_koleksi_UTC':stamp,'Metode_koleksi':platform+' API / komentar utama / '+(order if platform=='YouTube' else 'urutan API')})
                 if len(rows)>=limit: break
             if len(rows)>=limit: break
             if not more: status='Halaman API habis sebelum target'; break
@@ -74,7 +74,7 @@ def collect(platform, url, credential, limit, order='time'):
             if not rows: raise ValueError(status) from None
             break
     else: status='Batas halaman tercapai'
-    return pd.DataFrame(rows,columns=['Komentar','Video_ID','Likes','Waktu_komentar','Waktu_koleksi_UTC','Metode_koleksi']),status
+    return pd.DataFrame(rows,columns=['ID_Sumber','Komentar','Video_ID','Likes','Waktu_komentar','Waktu_koleksi_UTC','Metode_koleksi']),status
 
 def tags(text,patterns):
     return '; '.join(k for k,v in patterns.items() if re.search(v,text,re.I)) or 'Belum teridentifikasi'
@@ -133,7 +133,7 @@ def analyze(raw, model, extra, project, case, source):
     if 'Kasus' not in d: d['Kasus']=case
     if 'Sumber' not in d: d['Sumber']=source
     d['Kasus']=d.Kasus.fillna(case).astype(str); d['Sumber']=d.Sumber.fillna(source).astype(str)
-    d['Proyek']=project; d['ID']=[hashlib.sha256((str(datetime.now(timezone.utc))+str(i)).encode()).hexdigest()[:16] for i in range(len(d))]
+    d['Proyek']=project; d['ID']=[identity(row) for row in d.to_dict('records')]
     d['Normalisasi']=d.Komentar.map(normalize)
     pred=predict(model,d.Normalisasi.tolist()); d['Sentimen_AI']=[x[0] for x in pred]; d['Skor_Model']=[x[1] for x in pred]
     d['Relevansi_Saran']=d.Normalisasi.map(lambda t:relevance(t,extra)); d['Relevansi']='Belum diperiksa'
@@ -153,13 +153,14 @@ def analyze(raw, model, extra, project, case, source):
     d['Model']=MODEL
     return d,pd.DataFrame(ar,columns=['ID','Klausa_normalisasi','Aspek','Sentimen_Saran','Skor_Model','Validasi'])
 
-def ngrams(texts,n):
+def ngrams(texts,n,stop=None):
+    stop=STOP if stop is None else stop
     cnt=Counter()
     for t in texts:
         tokens=re.findall(r'\b[^\W\d_]+\b',t)
         for i in range(len(tokens)-n+1):
             window=tokens[i:i+n]
-            if all(w not in STOP for w in window): cnt[' '.join(window)]+=1
+            if all(w not in stop for w in window): cnt[' '.join(window)]+=1
     return pd.DataFrame(cnt.most_common(50),columns=['Frasa','Jumlah'])
 
 def summary_for(d):
@@ -176,26 +177,131 @@ def evaluate(d):
         met.append({'Metrik':'Cohen Kappa','Nilai':float(cohen_kappa_score(pairs.Coder_1,pairs.Coder_2,labels=LABELS)),'N':len(pairs)})
     return pd.DataFrame(met,columns=['Metrik','Nilai','N']),cm,report
 
+# V5 project snapshots: explicit download/restore, no shared server database.
+import uuid
+from Sastrawi.Stemmer.StemmerFactory import StemmerFactory
+from functools import lru_cache
+
+NEGATIONS={'tidak','bukan','belum','jangan','tanpa'}
+DEFAULTS={'data':pd.DataFrame(),'aspects':pd.DataFrame(),'raw':pd.DataFrame(),'collection_log':[], 'version':0,'batch_hashes':set(),'journal':[], 'codebook':[], 'audit':[], 'stopwords':'banget, koh, ko, nex, bang, sama', 'stemming':False,'raw_mode':'','raw_registry':{}}
+
+def identity(row):
+    token=row.get('ID_Sumber','')
+    if pd.notna(token) and str(token).strip(): return str(token)
+    # Imported/manual rows have no platform comment identifier. Preserve distinct rows.
+    return uuid.uuid4().hex
+
+def stable_case(platform,vid,registry):
+    key=platform+'|'+vid
+    if key not in registry: registry[key]=f'V{len(registry)+1:03d}'
+    return registry[key]
+
+def audit(action,detail):
+    st.session_state.audit.append({'UTC':datetime.now(timezone.utc).isoformat(),'Aksi':action,'Detail':detail})
+
+def records(frame):
+    return json.loads(frame.to_json(orient='records',force_ascii=False,date_format='iso'))
+
+def snapshot(project):
+    q=st.session_state
+    obj={'schema':5,'project':project,'data':records(q.data),'aspects':records(q.aspects),'raw':records(q.raw),'collection_log':q.collection_log,'journal':q.journal,'codebook':q.codebook,'audit':q.audit,'stopwords':q.stopwords,'stemming':q.stemming,'raw_mode':q.raw_mode,'raw_registry':q.raw_registry,'batch_hashes':list(q.batch_hashes)}
+    return json.dumps(obj,ensure_ascii=False,allow_nan=False).encode('utf-8')
+
+def decode_snapshot(blob):
+    obj=json.loads(blob)
+    if not isinstance(obj,dict) or obj.get('schema')!=5: raise ValueError('Gunakan cadangan JSON NetnoSense 5.0.')
+    if not isinstance(obj.get('project'),str) or not obj['project'].strip(): raise ValueError('Nama proyek tidak valid.')
+    out={}
+    for k in ('data','aspects','raw'):
+        if not isinstance(obj.get(k),list) or any(not isinstance(r,dict) for r in obj[k]): raise ValueError('Tabel cadangan tidak valid.')
+        out[k]=pd.DataFrame(obj[k])
+    required={'ID','Komentar','Kasus','Sumber','Proyek','Normalisasi','Sentimen_AI','Sentimen_Konteks_Saran','Skor_Model','Relevansi','Relevansi_Saran','Kode_Saran','Emosi_Saran','Aspek_Saran','Coder_1','Coder_2','Sentimen_Restoran','Sentimen_Kreator','Sentimen_Konten','Sentimen_Komunitas','Kode_Peneliti','Kategori_Peneliti','Tema_Peneliti','Catatan'}
+    d=out['data']; a=out['aspects']; raw=out['raw']
+    if not d.empty and (not required<=set(d.columns) or d.ID.isna().any() or d.ID.duplicated().any()): raise ValueError('Dataset cadangan tidak lengkap atau ID ganda.')
+    if not d.empty:
+        for c in required-{'Skor_Model'}: d[c]=d[c].fillna('').astype(str)
+    if not a.empty and (not {'ID','Klausa_normalisasi','Aspek','Sentimen_Saran','Skor_Model','Validasi'}<=set(a.columns) or d.empty or not a.ID.isin(d.ID).all()): raise ValueError('Tabel aspek tidak cocok.')
+    if not raw.empty and 'Komentar' not in raw: raise ValueError('Antrean data tidak valid.')
+    for k in ('collection_log','journal','codebook','audit'):
+        if not isinstance(obj.get(k),list) or any(not isinstance(r,dict) for r in obj[k]): raise ValueError('Metadata tidak valid.')
+        out[k]=obj[k]
+    if not isinstance(obj.get('raw_registry'),dict) or not all(isinstance(k,str) and isinstance(v,str) for k,v in obj['raw_registry'].items()): raise ValueError('Registry kasus tidak valid.')
+    out['raw_registry']=obj['raw_registry']; out['raw_mode']=str(obj.get('raw_mode','')); out['stopwords']=str(obj.get('stopwords','')); out['stemming']=bool(obj.get('stemming',False)); out['batch_hashes']=set(obj.get('batch_hashes',[])); out['project_name']=obj['project']
+    return out
+
+@st.cache_resource
+def stemmer(): return StemmerFactory().create_stemmer()
+
+@lru_cache(maxsize=20000)
+def stem_word(w): return w if w in NEGATIONS else stemmer().stem(w)
+
+def linguistic(text):
+    return ' '.join(stem_word(w) for w in re.findall(r'[^\W\d_]+',text)) if st.session_state.stemming else text
+
+def url_only(t): return bool(re.fullmatch(r'\s*(?:https?://|www\.)\S+\s*',str(t),re.I))
+
+def prepare(raw,existing,case,source,dedup=False):
+    r=raw.copy(); r=r[r.Komentar.notna()]; r['Komentar']=r.Komentar.astype(str).str.strip(); r=r[(r.Komentar!='') & ~r.Komentar.map(url_only) & ~r.Komentar.eq('[URL]')].copy()
+    if 'Kasus' not in r: r['Kasus']=case
+    if 'Sumber' not in r: r['Sumber']=source
+    r['Kasus']=r.Kasus.fillna(case).astype(str); r['Sumber']=r.Sumber.fillna(source).astype(str)
+    if 'ID_Sumber' in r:
+        ids=r.ID_Sumber.fillna('').astype(str); known=set(existing.ID_Sumber.dropna().astype(str)) if 'ID_Sumber' in existing else set()
+        r=r[~((ids!='') & (ids.isin(known)|ids.duplicated()))].copy()
+    if dedup:
+        keys=['Sumber','Kasus','Komentar']; r=r.drop_duplicates(keys)
+        if not existing.empty:
+            known=set(map(tuple,existing[keys].astype(str).to_numpy())); r=r.loc[[tuple(x) not in known for x in r[keys].astype(str).to_numpy()]]
+    return r.reset_index(drop=True)
+
 # Interface
-st.set_page_config(page_title='NetnoSense PRO 4.0',page_icon='📊',layout='wide')
+st.set_page_config(page_title='NetnoSense PRO 5.0',page_icon='📊',layout='wide')
 st.markdown("""<style>[data-testid='stSidebar']{background: #f0f4fa;} div[data-testid='stMetric']{border:1px solid #d7e0eb;border-radius:12px;padding:14px;} .block-container{padding-top:2rem;} </style>""",unsafe_allow_html=True)
-st.title('NetnoSense PRO 4.0')
+st.title('NetnoSense PRO 5.0')
 st.caption('RESEARCH INTELLIGENCE  /  Digital consumer behavior & netnography')
+for k,default in DEFAULTS.items():
+    if k not in st.session_state: st.session_state[k]=default.copy() if hasattr(default,'copy') else default
+if 'project_name' not in st.session_state: st.session_state.project_name='Food Vlogger Research'
+# Restore before sidebar widgets are instantiated, so name/settings can change safely.
+if st.session_state.get('restore_pending') is not None:
+    restored=st.session_state.pop('restore_pending'); st.session_state.update(restored); st.session_state.version+=1
 with st.sidebar:
-    project=st.text_input('Nama penelitian','Food Vlogger Research')
-    page=st.radio('Navigasi',['01 · Koleksi data','02 · Validasi & coding','03 · Dashboard','04 · Tema & bahasa','05 · Evaluasi','06 · Ekspor'])
-    st.caption('Data hanya disimpan dalam sesi. Ekspor sebelum menutup aplikasi.')
-    if st.button('Kosongkan proyek',disabled=not st.checkbox('Konfirmasi reset data sesi')):
-        for k in ['data','aspects','raw','collection_log','version','batch_hashes','raw_mode']: st.session_state.pop(k,None)
-        st.rerun()
-for k,default in [('data',pd.DataFrame()),('aspects',pd.DataFrame()),('raw',pd.DataFrame()),('collection_log',[]),('version',0),('batch_hashes',set())]:
-    if k not in st.session_state: st.session_state[k]=default
+    project=st.text_input('Nama penelitian',key='project_name',disabled=not st.session_state.data.empty or not st.session_state.raw.empty)
+    page=st.radio('Navigasi',['00 · Proyek & cadangan','01 · Koleksi data','02 · Validasi & coding','03 · Dashboard','04 · Tema & bahasa','05 · Evaluasi','06 · Ekspor','07 · Jurnal & codebook'])
+    st.caption('Sesi privat sementara. Cadangan JSON lokal dapat dibuka kembali. Tidak ada penyimpanan database permanen atau akun kolaborator.')
+    st.metric('Komentar tersimpan',len(st.session_state.data))
+if page.startswith('00'):
+    st.header('Proyek & cadangan'); st.warning('Simpan cadangan pada perangkat yang aman. JSON berisi data penelitian, bukan kredensial API. Jangan unggah cadangan ke GitHub publik.')
+    st.download_button('Unduh cadangan proyek JSON',snapshot(project),'NetnoSense_5_project.json',mime='application/json')
+    f=st.file_uploader('Buka cadangan proyek 5.0',type=['json']); confirm=st.checkbox('Saya setuju mengganti seluruh data sesi dengan cadangan')
+    if st.button('Pulihkan proyek',disabled=not(f and confirm)):
+        try:
+            st.session_state.restore_pending=decode_snapshot(f.getvalue()); st.rerun()
+        except (ValueError,TypeError,KeyError): st.error('Cadangan tidak valid atau tidak lengkap.')
+    if st.button('Proyek baru / kosongkan sesi',disabled=not st.checkbox('Saya sudah mencadangkan proyek dan setuju mengosongkan sesi')):
+        st.session_state.restore_pending={**{k:(v.copy() if hasattr(v,'copy') else v) for k,v in DEFAULTS.items() if k!='version'},'project_name':'Proyek baru'}; st.rerun()
+    st.subheader('Audit trail'); st.dataframe(pd.DataFrame(st.session_state.audit),hide_index=True)
+    st.stop()
+if page.startswith('07'):
+    st.header('Immersion journal & custom codebook')
+    with st.form('journal',clear_on_submit=True):
+        jcase=st.text_input('Kode kasus'); context=st.text_area('Konteks video dan interaksi'); observation=st.text_area('Observasi'); reflection=st.text_area('Refleksi / memo / kemungkinan bias')
+        if st.form_submit_button('Simpan catatan'):
+            st.session_state.journal.append({'UTC':datetime.now(timezone.utc).isoformat(),'Kasus':jcase,'Konteks':redact(context),'Observasi':redact(observation),'Refleksi':redact(reflection)}); audit('Jurnal','Catatan baru')
+    st.dataframe(pd.DataFrame(st.session_state.journal),hide_index=True)
+    cb=pd.DataFrame(st.session_state.codebook,columns=['Kode','Definisi','Inklusi','Eksklusi','Kategori','Tema'])
+    with st.form('codebook'):
+        edited=st.data_editor(cb,num_rows='dynamic',hide_index=True)
+        if st.form_submit_button('Simpan codebook'):
+            st.session_state.codebook=records(edited.fillna('')); audit('Codebook',f'{len(edited)} baris'); st.success('Codebook tersimpan di sesi.')
+    st.caption('Codebook adalah pedoman pengodean manusia, tidak otomatis melatih model AI.')
+    st.stop()
 
 if page.startswith('01'):
     st.header('Koleksi data')
     st.warning('Gunakan data yang diizinkan dan telah dianonimkan. Redaksi otomatis tidak menjamin anonimitas. Jangan unggah informasi pribadi atau API key ke GitHub.')
     mode=st.radio('Metode input',['Input manual','Upload Excel/CSV','YouTube API','TikTok Research API'],horizontal=True)
-    case=st.text_input('Kode kasus / awalan kode video','V01')
+    case=st.text_input('Kode kasus untuk input manual / impor','M01'); st.caption('Kasus API diberi kode V001, V002, dst. secara otomatis dan stabil.')
     raw=None; source='Lainnya'
     if mode in ['Input manual','Upload Excel/CSV']:
         source=st.selectbox('Sumber data',['TikTok','YouTube','Instagram','Google Reviews','X','Lainnya'])
@@ -219,7 +325,6 @@ if page.startswith('01'):
         order=st.selectbox('Urutan YouTube',['time','relevance']) if source=='YouTube' else 'API'
         allowed=st.checkbox('Saya memiliki izin menggunakan API dan data ini untuk penelitian')
         if st.button('Ambil komentar',disabled=not allowed):
-            st.session_state.raw=pd.DataFrame()
             inputs=list(dict.fromkeys(z.strip() for z in urls.splitlines() if z.strip()))
             if not credential or not inputs or len(inputs)>10: st.error('Isi kredensial dan 1–10 URL/ID.')
             else:
@@ -231,14 +336,18 @@ if page.startswith('01'):
                             if vid in seen_v: continue
                             seen_v.add(vid)
                             batch,status=collect(source,u,credential,int(limit),order)
-                            batch['Kasus']=case if len(inputs)==1 else f'{case}-{i+1:02d}'; batch['Sumber']=source
+                            batch['Kasus']=stable_case(source,vid,st.session_state.raw_registry); batch['Sumber']=source
                             batches.append(batch); log.append({'Platform':source,'Video_ID':vid,'Kasus':batch.Kasus.iloc[0] if len(batch) else case,'Target':int(limit),'Diperoleh':len(batch),'Status':status})
                         except ValueError as e: log.append({'Platform':source,'Video_ID':'','Kasus':case,'Target':int(limit),'Diperoleh':0,'Status':str(e)})
-                st.session_state.raw=pd.concat(batches,ignore_index=True) if batches else pd.DataFrame(); st.session_state.collection_log.extend(log)
+                st.session_state.raw=pd.concat([st.session_state.raw]+batches,ignore_index=True) if batches else st.session_state.raw
+                if 'ID_Sumber' in st.session_state.raw:
+                    known=set(st.session_state.data.ID_Sumber.dropna()) if 'ID_Sumber' in st.session_state.data else set()
+                    st.session_state.raw=st.session_state.raw[~st.session_state.raw.ID_Sumber.isin(known)].drop_duplicates('ID_Sumber').reset_index(drop=True)
+                st.session_state.collection_log.extend(log); audit('Koleksi',f'{source}: {len(log)} permintaan')
                 st.session_state.raw_mode=mode
                 st.dataframe(pd.DataFrame(log),hide_index=True)
-        if st.session_state.get('raw_mode')==mode and not st.session_state.raw.empty:
-            raw=st.session_state.raw.copy(); st.success(f'{len(raw)} komentar tersedia dari {source}.'); st.dataframe(raw.head(10),hide_index=True)
+        if not st.session_state.raw.empty:
+            raw=st.session_state.raw.copy(); st.success(f'{len(raw)} komentar dalam antrean lintas API, belum tentu dianalisis.'); st.dataframe(raw.head(10),hide_index=True)
             st.download_button('Unduh koleksi CSV',raw.map(safe_cell).to_csv(index=False).encode('utf-8-sig'),'koleksi.csv')
     extra=[normalize(x.strip()) for x in st.text_input('Kata kunci relevansi tambahan (pisahkan koma)','').split(',') if x.strip()]
     dedup=st.checkbox('Hapus teks identik dalam kasus yang sama (opsional)',False)
@@ -246,18 +355,23 @@ if page.startswith('01'):
         if raw is None or raw.empty: st.warning('Masukkan atau ambil komentar terlebih dahulu.')
         else:
             try:
-                if dedup: raw=raw.drop_duplicates(subset=['Komentar']+(['Kasus'] if 'Kasus' in raw else []))
+                before=len(raw); raw=prepare(raw,st.session_state.data,case,source,dedup)
+                if raw.empty: raise ValueError('Tidak ada komentar baru. URL tanpa teks, baris kosong dan ID sumber berulang ditolak.')
+                st.info(f'{before-len(raw)} baris disaring sebelum analisis.')
                 if not st.session_state.data.empty and project != st.session_state.data.Proyek.iloc[0]:
                     raise ValueError('Ekspor dan reset sebelum mengganti nama proyek.')
                 fingerprint=hashlib.sha256((project+source+case+raw.fillna('').astype(str).drop(columns=['Waktu_koleksi_UTC'],errors='ignore').to_csv(index=False)).encode()).hexdigest()
                 if fingerprint in st.session_state.batch_hashes: raise ValueError('Batch identik sudah ditambahkan.')
                 with st.spinner('Model sedang memproses komentar dan klausa...'):
                     d,a=analyze(raw,load_model(),extra,project,case,source)
-                st.session_state.data=pd.concat([st.session_state.data,d],ignore_index=True); st.session_state.aspects=pd.concat([st.session_state.aspects,a],ignore_index=True); st.session_state.version+=1; st.session_state.batch_hashes.add(fingerprint)
+                st.session_state.data=pd.concat([st.session_state.data,d],ignore_index=True); st.session_state.aspects=pd.concat([st.session_state.aspects,a],ignore_index=True); st.session_state.version+=1; st.session_state.batch_hashes.add(fingerprint); audit('Analisis',f'{len(d)} komentar masuk; {before-len(raw)} disaring')
+                if mode in ('YouTube API','TikTok Research API'): st.session_state.raw=pd.DataFrame()
                 st.success(f'{len(d)} komentar ditambahkan. Buka menu 02 atau 03. Jangan klik ulang untuk batch yang sama.')
             except ValueError as e: st.error(str(e))
             except Exception as e: st.error('Analisis gagal. Periksa format data atau log aplikasi. '+type(e).__name__)
-    st.metric('Komentar dalam sesi proyek',len(st.session_state.data))
+    c1,c2,c3=st.columns(3); c1.metric('Komentar dalam dataset',len(st.session_state.data)); c2.metric('Antrean belum dianalisis',len(st.session_state.raw)); c3.metric('Kasus tersimpan',st.session_state.data.Kasus.nunique() if not st.session_state.data.empty else 0)
+    st.caption('Log adalah riwayat permintaan, bukan jumlah unik. Analisis & tambahkan diperlukan untuk memindahkan antrean ke dataset.')
+    if not st.session_state.data.empty: st.dataframe(st.session_state.data.groupby(['Sumber','Kasus']).size().reset_index(name='Tersimpan'),hide_index=True)
     if st.session_state.collection_log: st.dataframe(pd.DataFrame(st.session_state.collection_log),hide_index=True)
     st.stop()
 
@@ -276,14 +390,14 @@ if page.startswith('02'):
         edited=st.data_editor(d[visible],disabled=[c for c in visible if c not in editable],column_config=config,hide_index=True,key=f'edit_{mode}_{st.session_state.version}')
         if st.form_submit_button('Simpan pengodean'):
             for c in editable: d[c]=edited[c].values
-            st.session_state.data=d; st.session_state.version+=1; st.rerun()
+            st.session_state.data=d; audit('Pengodean',mode); st.session_state.version+=1; st.rerun()
     if mode=='Peneliti / pengodean' and not aspects.empty:
         st.subheader('Validasi aspek / klausa')
         st.caption('Aspek berbasis kamus, polaritas klausa dari model umum; bukan ABSA terlatih.')
         with st.form('aspect_form'):
             ae=st.data_editor(aspects,disabled=[c for c in aspects if c!='Validasi'],column_config={'Validasi':st.column_config.SelectboxColumn('Validasi',options=[PENDING]+LABELS)},hide_index=True,key=f'ae_{st.session_state.version}')
             if st.form_submit_button('Simpan validasi aspek'):
-                st.session_state.aspects=ae; st.session_state.version+=1; st.rerun()
+                st.session_state.aspects=ae; audit('Validasi aspek',f'{len(ae)} baris'); st.session_state.version+=1; st.rerun()
     st.stop()
 
 # Common filtered data: exclude only human-confirmed irrelevant/spam by default.
@@ -296,8 +410,10 @@ summary=summary_for(scope); cross=scope.groupby(['Kasus','Sentimen_Final']).size
 a=aspects[aspects.ID.isin(scope.ID)].copy() if not aspects.empty else aspects.copy()
 if not a.empty: a['Sentimen_Final']=a.Validasi.where(a.Validasi!=PENDING,a.Sentimen_Saran)
 behavior_counts=counts_of(scope.Kode_Saran); emotion_counts=counts_of(scope.Emosi_Saran)
-freqs={n:ngrams(scope.Normalisasi,n) for n in (1,2,3)}
-metrics,cm,report=evaluate(d)
+stop=(STOP|set(normalize(st.session_state.stopwords).replace(',',' ').split()))-NEGATIONS
+texts=scope.Normalisasi.map(linguistic)
+freqs={n:ngrams(texts,n,stop) for n in (1,2,3)}
+metrics,cm,report=evaluate(scope)
 if page.startswith('03'):
     st.header('Dashboard penelitian'); cols=st.columns(4)
     for col,label,val in zip(cols,['Komentar dalam cakupan','Kasus','Coder 1 terisi','Relevansi belum diperiksa'],[len(scope),scope.Kasus.nunique(),int((scope.Coder_1!=PENDING).sum()),int((scope.Relevansi=='Belum diperiksa').sum())]): col.metric(label,val)
@@ -305,6 +421,8 @@ if page.startswith('03'):
     if len(scope):
         st.plotly_chart(px.pie(summary[summary.Jumlah>0],names='Sentimen',values='Jumlah',hole=.55,color='Sentimen',color_discrete_map=COLORS))
         st.plotly_chart(px.bar(cross,x='Kasus',y='Persen',color='Sentimen_Final',barmode='group',color_discrete_map=COLORS,hover_data=['Jumlah'],title='Perbandingan antarkasus (%)'))
+    if len(cross):
+        heat=cross.pivot(index='Kasus',columns='Sentimen_Final',values='Persen').fillna(0); st.plotly_chart(px.imshow(heat,aspect='auto',color_continuous_scale='Blues',labels={'color':'Persen'},title='Heatmap sentimen per kasus'))
     st.subheader('Relevansi komentar'); st.dataframe(d.groupby(['Relevansi','Relevansi_Saran']).size().reset_index(name='Jumlah'),hide_index=True)
     for title,table in [('Kandidat perilaku',behavior_counts),('Indikasi emosi',emotion_counts)]:
         st.subheader(title)
@@ -318,12 +436,30 @@ if page.startswith('03'):
     else: st.info('Isi label objek pada menu 02.')
 elif page.startswith('04'):
     st.header('Eksplorasi bahasa & tema')
-    st.caption('Normalisasi memakai kamus terbatas, bukan stemming linguistik penuh. Kelompok TF-IDF adalah kandidat eksplorasi, bukan tema netnografi yang sudah teruji.')
+    with st.form('language'):
+        sw=st.text_area('Custom stopwords (pisahkan koma)',st.session_state.stopwords); stem=st.checkbox('Stemming Sastrawi untuk frekuensi kata',st.session_state.stemming)
+        if st.form_submit_button('Terapkan pengaturan bahasa'):
+            st.session_state.stopwords=sw; st.session_state.stemming=stem; audit('Bahasa','Pengaturan diperbarui'); st.rerun()
+    st.caption('Stemming hanya untuk frekuensi dan word cloud, bukan input model sentimen. Negasi dipertahankan.')
+    st.caption('Normalisasi memakai kamus terbatas; stemming opsional. Kelompok TF-IDF adalah kandidat eksplorasi, bukan tema netnografi yang sudah teruji.')
     tabs=st.tabs(['Unigram','Bigram','Trigram'])
     for n,tab in enumerate(tabs,1):
         with tab: st.dataframe(freqs[n],hide_index=True)
-    if len(freqs[1]):
-        wc=WordCloud(width=1200,height=600,background_color='white',random_state=42).generate_from_frequencies(dict(zip(freqs[1].Frasa,freqs[1].Jumlah))); st.image(wc.to_array()); png=io.BytesIO(); wc.to_image().save(png,format='PNG'); st.download_button('Unduh word cloud PNG',png.getvalue(),'wordcloud.png')
+    case_filter=st.selectbox('Word cloud: kasus',['Semua']+sorted(scope.Kasus.unique().tolist())); sent_filter=st.selectbox('Word cloud: sentimen',['Semua']+LABELS)
+    ws=scope[(scope.Kasus==case_filter) if case_filter!='Semua' else pd.Series(True,index=scope.index)]; ws=ws[ws.Sentimen_Final==sent_filter] if sent_filter!='Semua' else ws
+    wf=ngrams(ws.Normalisasi.map(linguistic),1,stop)
+    if len(wf):
+        wc=WordCloud(width=1200,height=600,background_color='white',random_state=42).generate_from_frequencies(dict(zip(wf.Frasa,wf.Jumlah))); st.image(wc.to_array()); png=io.BytesIO(); wc.to_image().save(png,format='PNG'); st.download_button('Unduh word cloud PNG',png.getvalue(),'wordcloud.png')
+    st.subheader('Ko-kemunculan kata berurutan (20 pasangan teratas)'); st.dataframe(freqs[2].head(20),hide_index=True)
+    edges=freqs[2].head(20)
+    if len(edges):
+        import plotly.graph_objects as go
+        import math
+        pairs=[(x.split()[0],x.split()[1]) for x in edges.Frasa]; nodes=sorted(set(w for pair in pairs for w in pair)); xy={w:(math.cos(2*math.pi*i/len(nodes)),math.sin(2*math.pi*i/len(nodes))) for i,w in enumerate(nodes)}
+        fig=go.Figure()
+        for (u,v),count in zip(pairs,edges.Jumlah):
+            fig.add_trace(go.Scatter(x=[xy[u][0],xy[v][0]],y=[xy[u][1],xy[v][1]],mode='lines',line=dict(width=1+4*count/edges.Jumlah.max(),color='#94a3b8'),name=f'{u} – {v}: {count}',hoverinfo='name',showlegend=False))
+        fig.add_trace(go.Scatter(x=[xy[w][0] for w in nodes],y=[xy[w][1] for w in nodes],text=nodes,mode='markers+text',textposition='top center',marker=dict(size=12,color='#2563eb'),showlegend=False)); fig.update_layout(xaxis=dict(visible=False),yaxis=dict(visible=False,scaleanchor='x'),height=550); st.plotly_chart(fig)
     st.subheader('Kandidat kelompok topik (TF-IDF + KMeans)')
     k=st.slider('Jumlah kelompok',2,10,3)
     if st.button('Eksplorasi kelompok topik'):
@@ -342,11 +478,11 @@ elif page.startswith('05'):
     else: st.dataframe(metrics,hide_index=True)
     if not cm.empty: st.subheader('Confusion matrix (baris: manusia, kolom: AI)'); st.dataframe(cm); st.dataframe(report)
 else:
-    st.header('Pusat ekspor'); st.caption('Ekspor mencakup dataset lengkap dan ringkasan sesuai cakupan yang dipilih. Pastikan data telah dianonimkan sesuai etika dan ketentuan API sebelum disimpan atau dibagikan.')
-    tables={'Dataset':d,'Cakupan':scope,'Ringkasan':summary,'Antarkasus':cross,'Aspek':a,'Perilaku':behavior_counts,'Emosi':emotion_counts,'Unigram':freqs[1],'Bigram':freqs[2],'Trigram':freqs[3],'Evaluasi':metrics,'Confusion_matrix':cm.reset_index(),'Metrik_per_kelas':report.reset_index(),'Log_koleksi':pd.DataFrame(st.session_state.collection_log)}
+    st.header('Pusat ekspor'); st.download_button('Cadangan proyek JSON',snapshot(project),'NetnoSense_5_project.json',mime='application/json'); st.caption('Ekspor mencakup dataset lengkap dan ringkasan sesuai cakupan yang dipilih. Pastikan data telah dianonimkan sesuai etika dan ketentuan API sebelum disimpan atau dibagikan.')
+    tables={'Dataset':d,'Cakupan':scope,'Ringkasan':summary,'Antarkasus':cross,'Aspek':a,'Perilaku':behavior_counts,'Emosi':emotion_counts,'Unigram':freqs[1],'Bigram':freqs[2],'Trigram':freqs[3],'Evaluasi':metrics,'Confusion_matrix':cm.reset_index(),'Metrik_per_kelas':report.reset_index(),'Log_koleksi':pd.DataFrame(st.session_state.collection_log),'Jurnal':pd.DataFrame(st.session_state.journal),'Codebook':pd.DataFrame(st.session_state.codebook),'Audit':pd.DataFrame(st.session_state.audit),'Antrean':st.session_state.raw}
     buf=io.BytesIO()
     with pd.ExcelWriter(buf,engine='openpyxl') as writer:
         for name,table in tables.items(): table.map(safe_cell).to_excel(writer,sheet_name=name,index=False)
-    st.download_button('Unduh seluruh hasil Excel',buf.getvalue(),'NetnoSense_PRO_4.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    st.download_button('Unduh seluruh hasil Excel',buf.getvalue(),'NetnoSense_PRO_5.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
     text='NETNOSENSE PRO 4.0 — LAPORAN DESKRIPTIF\n'+f'Proyek: {project}\nCakupan: {filter_mode}\nN: {len(scope)} / {len(d)}\n'+summary.to_string(index=False)+'\n\n'+cross.to_string(index=False)+'\n\nMetrik model:\n'+metrics.to_string(index=False)+'\n\nBatasan: prediksi dan pengodean otomatis bersifat sementara. Komentar tidak membuktikan perubahan kunjungan atau hubungan kausal.'
-    st.download_button('Unduh laporan TXT',text.encode('utf-8'),'laporan_v4.txt'); st.text(text)
+    st.download_button('Unduh laporan TXT',text.encode('utf-8'),'laporan_v5.txt'); st.text(text)
