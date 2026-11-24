@@ -4,4 +4,3 @@ plotly
 transformers>=4.48,<5
 torch>=2.6,<3
 openpyxl
-scikit-learn
