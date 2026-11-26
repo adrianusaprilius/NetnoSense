@@ -204,12 +204,12 @@ def records(frame):
 
 def snapshot(project):
     q=st.session_state
-    obj={'schema':6,'semantic':q.semantic,'project':project,'data':records(q.data),'aspects':records(q.aspects),'raw':records(q.raw),'collection_log':q.collection_log,'journal':q.journal,'codebook':q.codebook,'audit':q.audit,'stopwords':q.stopwords,'stemming':q.stemming,'raw_mode':q.raw_mode,'raw_registry':q.raw_registry,'batch_hashes':list(q.batch_hashes)}
+    obj={'schema':7,'semantic':q.semantic,'project':project,'data':records(q.data),'aspects':records(q.aspects),'raw':records(q.raw),'collection_log':q.collection_log,'journal':q.journal,'codebook':q.codebook,'audit':q.audit,'stopwords':q.stopwords,'stemming':q.stemming,'raw_mode':q.raw_mode,'raw_registry':q.raw_registry,'batch_hashes':list(q.batch_hashes)}
     return json.dumps(obj,ensure_ascii=False,allow_nan=False).encode('utf-8')
 
 def decode_snapshot(blob):
     obj=json.loads(blob)
-    if not isinstance(obj,dict) or obj.get('schema') not in (5,6): raise ValueError('Gunakan cadangan JSON NetnoSense 5.0 atau 6.0.')
+    if not isinstance(obj,dict) or obj.get('schema') not in (5,6,7): raise ValueError('Gunakan cadangan JSON NetnoSense 5.0, 6.0 atau 7.0.')
     if not isinstance(obj.get('project'),str) or not obj['project'].strip(): raise ValueError('Nama proyek tidak valid.')
     out={}
     for k in ('data','aspects','raw'):
@@ -294,7 +294,9 @@ def semantic_request(items, key, model, focus, codebook):
     try:
         r=requests.post('https://api.openai.com/v1/chat/completions',headers={'Authorization':'Bearer '+key},json=payload,timeout=90)
     except requests.RequestException: raise ValueError('Koneksi API gagal atau timeout.') from None
-    if not r.ok: raise ValueError(f'API mengembalikan HTTP {r.status_code}. Periksa key, akses model, saldo, atau kuota.')
+    if not r.ok:
+        hints={401:'Autentikasi gagal. Gunakan OpenAI API key yang aktif, bukan key YouTube.',403:'Akses API ditolak.',404:'Model atau endpoint tidak tersedia.',429:'Batas kuota, saldo atau laju API tercapai.'}
+        raise ValueError(f'API mengembalikan HTTP {r.status_code}. '+hints.get(r.status_code,'Periksa akses API atau coba kembali.'))
     body=r.json(); choice=body['choices'][0]
     if choice.get('finish_reason')!='stop': raise ValueError('Respons tidak lengkap; coba batch lebih kecil.')
     result=semantic_validate(json.loads(choice['message']['content']),items)
@@ -323,7 +325,7 @@ def semantic_page(d):
                 st.session_state.semantic.extend(result); total+=len(result); audit('AI semantik',f'{len(result)} baris; model={result[0]["Model_semantik"]}; prompt={PROMPT_VERSION}; tokens={usage.get("total_tokens","tidak diketahui")}'); progress.progress(total/len(selected))
             except (ValueError,KeyError,TypeError,IndexError) as e:
                 st.error('Batch dihentikan. Hasil batch sebelumnya tetap tersimpan. '+(str(e) if isinstance(e,ValueError) and not isinstance(e,json.JSONDecodeError) else 'Format respons API tidak valid.')); break
-        st.success(f'{total} rekomendasi baru tersimpan dalam sesi.')
+        (st.success if total else st.info)(f'{total} rekomendasi baru tersimpan di database.')
     table=pd.DataFrame(st.session_state.semantic)
     if not table.empty:
         st.subheader('Rekomendasi AI (belum divalidasi)'); st.dataframe(table,hide_index=True,column_config={'ID':None})
@@ -332,32 +334,301 @@ def semantic_page(d):
         st.caption('Kutipan diverifikasi sebagai substring sumber; makna dan tema tetap memerlukan pemeriksaan peneliti.')
 
 
-st.set_page_config(page_title='NetnoSense PRO 6.0',page_icon='📊',layout='wide')
+# V7 private cloud workspace. Credentials are configured only in Streamlit Secrets.
+import copy, hmac, time
+from datetime import timedelta, date
+import psycopg
+from psycopg.types.json import Jsonb
+
+P_TABLE='netnosense_private.projects'
+M_TABLE='netnosense_private.members'
+class CloudError(Exception): pass
+class Conflict(CloudError): pass
+
+def settings():
+    try:
+        cfg=st.secrets['netnosense']; accounts=dict(cfg['accounts']); admin=str(cfg['admin_user']); dsn=str(cfg['database_url'])
+        if not accounts or admin not in accounts or not dsn.startswith(('postgresql://','postgres://')): raise ValueError()
+        if any(not re.fullmatch(r'[A-Za-z0-9_.-]{1,64}',str(u)) or not isinstance(k,str) or len(k)<24 or 'GANTI' in k.upper() for u,k in accounts.items()): raise ValueError()
+        if len(set(accounts.values()))!=len(accounts): raise ValueError()
+        return dsn,admin,accounts
+    except Exception: return None
+
+def db():
+    dsn=settings()[0]
+    mode=psycopg.conninfo.conninfo_to_dict(dsn).get('sslmode','require')
+    if mode not in ('require','verify-ca','verify-full'): raise CloudError('Koneksi database wajib menggunakan SSL.')
+    return psycopg.connect(dsn,connect_timeout=10,sslmode=mode,prepare_threshold=None)
+
+def empty_payload(name):
+    return {'schema':7,'project':name,'data':[],'aspects':[],'raw':[],'collection_log':[],'journal':[],'codebook':[],'audit':[], 'stopwords':DEFAULTS['stopwords'],'stemming':False,'raw_mode':'','raw_registry':{},'batch_hashes':[],'semantic':[]}
+
+def access_role(cur,pid,user,lock=False):
+    # Serialize writes and membership changes on the parent row.
+    cur.execute(f'SELECT owner_name,expires_at,revision FROM {P_TABLE} WHERE id=%s'+(' FOR UPDATE' if lock else ''),(pid,))
+    r=cur.fetchone()
+    if not r or r[1]<=datetime.now(timezone.utc): raise CloudError('Proyek tidak tersedia atau masa retensinya habis.')
+    if r[0]==user: return 'owner',r[1],r[2]
+    cur.execute(f'SELECT role FROM {M_TABLE} WHERE project_id=%s AND username=%s',(pid,user)); m=cur.fetchone()
+    if not m: raise CloudError('Akses proyek tidak tersedia.')
+    return m[0],r[1],r[2]
+
+def list_projects(user):
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(f'DELETE FROM {P_TABLE} WHERE expires_at<=now()')
+        cur.execute(f'''SELECT p.id,p.name,CASE WHEN p.owner_name=%s THEN 'owner' ELSE m.role END,p.updated_at,p.expires_at
+        FROM {P_TABLE} p LEFT JOIN {M_TABLE} m ON m.project_id=p.id AND m.username=%s
+        WHERE (p.owner_name=%s OR m.username=%s) AND p.expires_at>now() ORDER BY p.updated_at DESC''',(user,user,user,user))
+        return cur.fetchall()
+
+def create_project(user,name,expiry):
+    if user!=settings()[1]: raise CloudError('Hanya admin dapat membuat proyek.')
+    name=name.strip()
+    if not 1<=len(name)<=160 or expiry<=datetime.now(timezone.utc): raise CloudError('Nama atau batas retensi tidak valid.')
+    pid=str(uuid.uuid4())
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(f'INSERT INTO {P_TABLE}(id,name,owner_name,payload,expires_at) VALUES (%s,%s,%s,%s,%s)',(pid,name,user,Jsonb(empty_payload(name)),expiry))
+    return pid
+
+def read_project(pid,user):
+    with db() as conn, conn.cursor() as cur:
+        role,expiry,revision=access_role(cur,pid,user,lock=True)
+        cur.execute(f'SELECT name,payload FROM {P_TABLE} WHERE id=%s',(pid,)); name,payload=cur.fetchone()
+    return name,payload,role,expiry,revision
+
+def api_expiry(payload,expiry):
+    # Conservative cap for known API records. Imported records without provenance
+    # remain the researcher's responsibility. No retention extension on re-save.
+    for table in ('data','raw'):
+        for row in payload.get(table,[]):
+            method=str(row.get('Metode_koleksi','')).lower()
+            if 'youtube api' not in method and 'tiktok api' not in method: continue
+            try:
+                stamp=datetime.fromisoformat(str(row['Waktu_koleksi_UTC']).replace('Z','+00:00'))
+                if stamp.tzinfo is None: raise ValueError()
+            except (KeyError,ValueError,TypeError): raise CloudError('Data API tanpa waktu koleksi yang sah; perbaiki sumber sebelum menyimpan.') from None
+            if stamp>datetime.now(timezone.utc)+timedelta(minutes=5): raise CloudError('Waktu koleksi API berada di masa depan.')
+            expiry=min(expiry,stamp+timedelta(days=30))
+    if expiry<=datetime.now(timezone.utc): raise CloudError('Batas retensi data API telah lewat. Jangan simpan ulang data lama.')
+    return expiry
+
+def coder_payload(latest, candidate, role, actor):
+    # Only the assigned human label may change; all other submitted fields ignored.
+    col={'coder1':'Coder_1','coder2':'Coder_2'}[role]
+    current=latest['data']; proposed=candidate['data']
+    values={r['ID']:r.get(col,PENDING) for r in proposed}
+    if len(values)!=len(proposed) or set(values)!={r['ID'] for r in current}: raise Conflict('Dataset telah berubah. Muat ulang proyek.')
+    if any(v not in LABELS+[PENDING] for v in values.values()): raise CloudError('Label coder tidak valid.')
+    out=copy.deepcopy(latest)
+    for r in out['data']: r[col]=values[r['ID']]
+    out['audit'].append({'UTC':datetime.now(timezone.utc).isoformat(),'Aksi':'Pengodean independen','Detail':role,'Aktor':actor})
+    return out
+
+def save_project(pid,user,expected,payload,expected_role,baseline=None):
+    with db() as conn, conn.cursor() as cur:
+        role,expiry,revision=access_role(cur,pid,user,lock=True)
+        if role!=expected_role: raise CloudError('Peran telah berubah. Buka ulang proyek.')
+        if revision!=expected and role=='owner': raise Conflict('Versi database lebih baru. Perubahan lokal tidak menimpa data kolaborator.')
+        cur.execute(f'SELECT name,payload FROM {P_TABLE} WHERE id=%s',(pid,)); name,latest=cur.fetchone()
+        if role!='owner':
+            col={'coder1':'Coder_1','coder2':'Coder_2'}[role]
+            if baseline!={r['ID']:(r.get('Komentar'),r.get(col,PENDING)) for r in latest['data']}: raise Conflict('Dataset atau label Anda telah berubah. Muat ulang proyek.')
+            payload=coder_payload(latest,payload,role,user)
+        expected=revision
+        if payload.get('project')!=name: raise CloudError('Nama proyek cadangan tidak sesuai.')
+        expiry=api_expiry(payload,expiry)
+        cur.execute(f'UPDATE {P_TABLE} SET payload=%s,revision=revision+1,updated_at=now(),expires_at=%s WHERE id=%s AND revision=%s RETURNING revision',(Jsonb(payload),expiry,pid,expected))
+        saved=cur.fetchone()
+        if not saved: raise Conflict('Versi database telah berubah.')
+    return saved[0],expiry,payload
+
+def change_member(pid,user,target,role):
+    if target not in settings()[2] or target==user or role not in ('coder1','coder2','hapus'): raise CloudError('Akun/peran tidak valid.')
+    with db() as conn, conn.cursor() as cur:
+        current,_,_=access_role(cur,pid,user,lock=True)
+        if current!='owner': raise CloudError('Hanya pemilik dapat mengatur akses.')
+        if role=='hapus': cur.execute(f'DELETE FROM {M_TABLE} WHERE project_id=%s AND username=%s',(pid,target))
+        else:
+            cur.execute(f'SELECT username FROM {M_TABLE} WHERE project_id=%s AND role=%s AND username<>%s',(pid,role,target))
+            if cur.fetchone(): raise CloudError('Peran tersebut sudah diisi. Cabut akses lama dahulu.')
+            cur.execute(f'INSERT INTO {M_TABLE}(project_id,username,role) VALUES (%s,%s,%s) ON CONFLICT(project_id,username) DO UPDATE SET role=EXCLUDED.role',(pid,target,role))
+        cur.execute(f'UPDATE {P_TABLE} SET revision=revision+1,updated_at=now() WHERE id=%s',(pid,))
+
+def members(pid,user):
+    with db() as conn, conn.cursor() as cur:
+        role,_,_=access_role(cur,pid,user,lock=True)
+        if role!='owner': raise CloudError('Hanya pemilik dapat melihat pengaturan akses.')
+        cur.execute(f'SELECT username,role FROM {M_TABLE} WHERE project_id=%s ORDER BY role',(pid,)); return cur.fetchall()
+
+def delete_project(pid,user,expected):
+    with db() as conn, conn.cursor() as cur:
+        role,_,rev=access_role(cur,pid,user,lock=True)
+        if role!='owner' or rev!=expected: raise Conflict('Tidak berwenang atau revisi berubah. Muat ulang.')
+        cur.execute(f'DELETE FROM {P_TABLE} WHERE id=%s',(pid,))
+
+def clear_workspace(keep_auth=True):
+    q=st.session_state; user=q.get('cloud_user'); sig=q.get('cloud_signature')
+    for k in list(q.keys()): del q[k]
+    if keep_auth and user: q.cloud_user=user; q.cloud_signature=sig
+
+def apply_cloud(name,payload,role,expiry,revision,pid):
+    restored=decode_snapshot(json.dumps(payload)); q=st.session_state
+    old_version=q.get('version',0)
+    q.update(restored); q.project_name=name; q.version=old_version+1
+    q.cloud_pid=str(pid); q.cloud_role=role; q.cloud_revision=revision; q.cloud_expiry=expiry; q.cloud_dirty=False; q.cloud_message=''
+    col={'coder1':'Coder_1','coder2':'Coder_2'}.get(role)
+    q.cloud_coder_base={r['ID']:(r.get('Komentar'),r.get(col,PENDING)) for r in payload['data']} if col else None
+
+def safe_cloud_message(e): return str(e) if isinstance(e,CloudError) else 'Database tidak dapat diakses. Periksa konfigurasi, koneksi atau SQL instalasi. Detail rahasia tidak ditampilkan.'
+
+def persist():
+    q=st.session_state; q.cloud_dirty=True
+    try:
+        payload=json.loads(snapshot(q.project_name)); rev,expiry,saved=save_project(q.cloud_pid,q.cloud_user,q.cloud_revision,payload,q.cloud_role,q.get('cloud_coder_base'))
+        if q.cloud_role!='owner':
+            q.update(decode_snapshot(json.dumps(saved))); col={'coder1':'Coder_1','coder2':'Coder_2'}[q.cloud_role]; q.cloud_coder_base={r['ID']:(r.get('Komentar'),r.get(col,PENDING)) for r in saved['data']}
+        q.cloud_revision=rev; q.cloud_expiry=expiry; q.cloud_dirty=False; q.cloud_message=''
+        return True
+    except Exception as e:
+        q.cloud_message=safe_cloud_message(e); st.error('Belum tersimpan ke database: '+q.cloud_message); return False
+
+def audit(action,detail):
+    st.session_state.audit.append({'UTC':datetime.now(timezone.utc).isoformat(),'Aksi':action,'Detail':detail,'Aktor':st.session_state.cloud_user})
+    if not persist(): st.stop()
+
+def login_signature(token): return hashlib.sha256(token.encode()).hexdigest()
+
+def cloud_gate():
+    q=st.session_state; cfg=settings()
+    if not cfg:
+        st.header('Konfigurasi NetnoSense PRO 7.0'); st.info('Database dan akun belum dikonfigurasi. Ikuti PANDUAN.txt: jalankan database.sql di Supabase, lalu masukkan konfigurasi ke Streamlit Secrets. Tidak ada data penelitian yang dibuka sebelum login.'); st.stop()
+    _,admin,accounts=cfg
+    if q.get('cloud_user') not in accounts or not hmac.compare_digest(str(q.get('cloud_signature','')),login_signature(accounts.get(q.get('cloud_user'),''))):
+        if q.get('cloud_user'): clear_workspace(False)
+        st.header('Masuk ke ruang penelitian')
+        with st.form('login',clear_on_submit=True):
+            username=st.text_input('Nama akun'); token=st.text_input('Kode akses privat',type='password'); submitted=st.form_submit_button('Masuk',type='primary')
+        if submitted:
+            candidate=accounts.get(username,''); ok=hmac.compare_digest(login_signature(token),login_signature(candidate)) and bool(candidate)
+            if ok:
+                clear_workspace(False); q.cloud_user=username; q.cloud_signature=login_signature(candidate); st.rerun()
+            else: time.sleep(1); st.error('Nama akun atau kode akses tidak cocok.')
+        st.caption('Gunakan kode acak yang panjang dan berbeda untuk setiap akun. Login kembali setelah sesi browser berakhir.'); st.stop()
+    user=q.cloud_user
+    if q.get('cloud_pid'):
+        try:
+            with db() as conn, conn.cursor() as cur: role,expiry,rev=access_role(cur,q.cloud_pid,user)
+        except Exception as e:
+            st.error(safe_cloud_message(e))
+            if st.button('Kembali ke daftar proyek'): clear_workspace(); st.rerun()
+            st.stop()
+        if role!=q.cloud_role:
+            clear_workspace(); st.warning('Peran berubah. Buka ulang proyek.'); st.rerun()
+        with st.sidebar:
+            st.caption(f'Akun: {user} · {role}'); st.caption(f'Database: revisi {q.cloud_revision} · retensi hingga {expiry:%Y-%m-%d %H:%M} UTC')
+            if st.button('Tutup proyek',disabled=q.get('cloud_dirty',False)): clear_workspace(); st.rerun()
+            if st.button('Keluar',disabled=q.get('cloud_dirty',False)): clear_workspace(False); st.rerun()
+        if q.get('cloud_dirty'):
+            st.warning('Perubahan lokal belum tersimpan. Simpan ulang bila memungkinkan atau muat ulang setelah mencadangkan perubahan.')
+            if q.get('cloud_message'): st.error(q.cloud_message)
+            if role=='owner' and q.get('cloud_dirty'): st.download_button('Unduh cadangan lokal sebelum memuat ulang',snapshot(q.project_name),'recovery_7.json',mime='application/json')
+            if role!='owner':
+                col={'coder1':'Coder_1','coder2':'Coder_2'}[role]; st.download_button('Unduh label lokal Anda (CSV)',q.data[['ID',col]].map(safe_cell).to_csv(index=False).encode('utf-8-sig'),'label_lokal.csv')
+            if (rev==q.cloud_revision or role!='owner') and st.button('Coba simpan lagi'):
+                if persist(): st.rerun()
+            if st.button('Muat ulang dari database (buang perubahan lokal)'):
+                pid=q.cloud_pid
+                try:
+                    result=read_project(pid,user); clear_workspace(); apply_cloud(*result,pid); st.rerun()
+                except Exception as e: st.error(safe_cloud_message(e))
+            st.stop()
+        if rev!=q.cloud_revision:
+            st.warning('Ada revisi baru di database. Pemilik perlu memuat ulang sebelum menyimpan. Label coder dapat digabung jika dataset dan label miliknya tidak berubah.')
+            if st.button('Muat versi terbaru (tanpa menyimpan perubahan formulir)'):
+                pid=q.cloud_pid
+                try:
+                    result=read_project(pid,user); clear_workspace(); apply_cloud(*result,pid); st.rerun()
+                except Exception as e: st.error(safe_cloud_message(e))
+        return
+    with st.sidebar:
+        st.caption('Akun: '+user)
+        if st.button('Keluar'): clear_workspace(False); st.rerun()
+    st.header('Ruang penelitian · proyek cloud')
+    st.caption('Proyek tersimpan lintas sesi sampai dihapus atau batas retensi tercapai. Gunakan hanya data yang diizinkan untuk penyimpanan cloud.')
+    try: rows=list_projects(user)
+    except Exception as e: st.error(safe_cloud_message(e)); st.stop()
+    if rows:
+        display={str(r[0]):f'{r[1]} · {r[2]} · diperbarui {r[3]:%Y-%m-%d %H:%M} UTC' for r in rows}
+        pid=st.selectbox('Pilih proyek',list(display),format_func=lambda p:display[p])
+        if st.button('Buka proyek',type='primary'):
+            try:
+                result=read_project(pid,user); clear_workspace(); apply_cloud(*result,pid); st.rerun()
+            except Exception as e: st.error(safe_cloud_message(e))
+    else: st.info('Belum ada proyek yang dapat Anda akses.')
+    if user==admin:
+        with st.form('new_project'):
+            st.subheader('Buat proyek baru'); name=st.text_input('Nama penelitian','Food Vlogger Research'); deadline=st.date_input('Tanggal terakhir retensi (UTC)',value=date.today()+timedelta(days=29),min_value=date.today(),max_value=date.today()+timedelta(days=365)); consent=st.checkbox('Saya memiliki izin menyimpan data penelitian di cloud, dan akan mematuhi retensi serta penghapusan data.'); submit=st.form_submit_button('Buat proyek')
+        if submit:
+            if not consent: st.warning('Konfirmasi izin penyimpanan dahulu.')
+            else:
+                try:
+                    expiry=datetime.combine(deadline+timedelta(days=1),datetime.min.time(),tzinfo=timezone.utc); pid=create_project(user,name,expiry); result=read_project(pid,user); clear_workspace(); apply_cloud(*result,pid); st.rerun()
+                except Exception as e: st.error(safe_cloud_message(e))
+    st.stop()
+
+
+st.set_page_config(page_title='NetnoSense PRO 7.0',page_icon='📊',layout='wide')
 st.markdown("""<style>[data-testid='stSidebar']{background: #f0f4fa;} div[data-testid='stMetric']{border:1px solid #d7e0eb;border-radius:12px;padding:14px;} .block-container{padding-top:2rem;} </style>""",unsafe_allow_html=True)
-st.title('NetnoSense PRO 6.0')
-st.caption('SCIENTIFIC RESEARCH EDITION  /  Digital consumer behavior & netnography')
-for k,default in DEFAULTS.items():
-    if k not in st.session_state: st.session_state[k]=default.copy() if hasattr(default,'copy') else default
-if 'project_name' not in st.session_state: st.session_state.project_name='Food Vlogger Research'
-# Restore before sidebar widgets are instantiated, so name/settings can change safely.
-if st.session_state.get('restore_pending') is not None:
-    restored=st.session_state.pop('restore_pending'); st.session_state.update(restored); st.session_state.version+=1
+st.title('NetnoSense PRO 7.0')
+st.caption('COLLABORATIVE RESEARCH PLATFORM  /  Digital consumer behavior & netnography')
+cloud_gate()
+# Role-limited navigation; coder cannot access dashboard, model, backup or exports.
 with st.sidebar:
-    project=st.text_input('Nama penelitian',key='project_name',disabled=not st.session_state.data.empty or not st.session_state.raw.empty)
-    page=st.radio('Navigasi',['00 · Proyek & cadangan','01 · Koleksi data','02 · Validasi & coding','03 · Dashboard','04 · Tema & bahasa','05 · Evaluasi','06 · Ekspor','07 · Jurnal & codebook','08 · Scientific AI'])
-    st.caption('Sesi privat sementara. Cadangan JSON lokal dapat dibuka kembali. Tidak ada penyimpanan database permanen atau akun kolaborator.')
+    project=st.session_state.project_name
+    st.text_input('Nama penelitian',value=project,disabled=True)
+    if st.session_state.cloud_role=='owner':
+        page=st.radio('Navigasi',['00 · Proyek & cadangan','01 · Koleksi data','02 · Validasi & coding','03 · Dashboard','04 · Tema & bahasa','05 · Evaluasi','06 · Ekspor','07 · Jurnal & codebook','08 · Scientific AI','09 · Tim & retensi'])
+    else:
+        page='02 · Validasi & coding'; st.caption('Ruang coder independen — hanya label Anda yang dapat diubah.')
     st.metric('Komentar tersimpan',len(st.session_state.data))
+    st.caption('Perubahan yang disimpan melalui tombol aplikasi masuk ke database. Jangan simpan data atau API key di GitHub.')
 if page.startswith('00'):
-    st.header('Proyek & cadangan'); st.warning('Simpan cadangan pada perangkat yang aman. JSON berisi data penelitian, bukan kredensial API. Jangan unggah cadangan ke GitHub publik.')
-    st.download_button('Unduh cadangan proyek JSON',snapshot(project),'NetnoSense_6_project.json',mime='application/json')
-    f=st.file_uploader('Buka cadangan proyek 5.0 / 6.0',type=['json']); confirm=st.checkbox('Saya setuju mengganti seluruh data sesi dengan cadangan')
+    st.header('Proyek & cadangan cloud')
+    st.success('Proyek terhubung ke database. Buka proyek yang sama setelah login kembali.')
+    st.warning('Cadangan lokal berisi data penelitian. Simpan hanya selama diizinkan. Jangan unggah cadangan ke GitHub publik.')
+    st.download_button('Unduh cadangan proyek JSON',snapshot(project),'NetnoSense_7_project.json',mime='application/json')
+    f=st.file_uploader('Buka cadangan proyek 5.0 / 6.0 / 7.0',type=['json']); confirm=st.checkbox('Saya memiliki izin penyimpanan cloud dan setuju mengganti seluruh isi proyek dengan cadangan ini')
     if st.button('Pulihkan proyek',disabled=not(f and confirm)):
         try:
-            st.session_state.restore_pending=decode_snapshot(f.getvalue()); st.rerun()
-        except (ValueError,TypeError,KeyError): st.error('Cadangan tidak valid atau tidak lengkap.')
-    if st.button('Proyek baru / kosongkan sesi',disabled=not st.checkbox('Saya sudah mencadangkan proyek dan setuju mengosongkan sesi')):
-        st.session_state.restore_pending={**{k:(v.copy() if hasattr(v,'copy') else v) for k,v in DEFAULTS.items() if k!='version'},'project_name':'Proyek baru'}; st.rerun()
+            restored=decode_snapshot(f.getvalue())
+            if restored['project_name']!=project: raise CloudError('Nama proyek cadangan berbeda. Buat proyek dengan nama yang sama seperti cadangan.')
+            # Validate retention before replacing local state.
+            api_expiry(json.loads(f.getvalue()),st.session_state.cloud_expiry)
+            st.session_state.update(restored); st.session_state.version+=1; audit('Pemulihan','Cadangan JSON dimasukkan'); st.rerun()
+        except Exception as e: st.error(safe_cloud_message(e) if isinstance(e,CloudError) else 'Cadangan tidak valid atau tidak lengkap.')
     st.subheader('Audit trail'); st.dataframe(pd.DataFrame(st.session_state.audit),hide_index=True)
+    st.stop()
+if page.startswith('09'):
+    st.header('Tim penelitian & retensi')
+    st.caption('Akun dibuat oleh pengelola aplikasi di Streamlit Secrets. Pemilik memberikan akses per proyek. Satu orang berbeda untuk masing-masing coder.')
+    try:
+        st.dataframe(pd.DataFrame(members(st.session_state.cloud_pid,st.session_state.cloud_user),columns=['Akun','Peran']),hide_index=True)
+    except Exception as e: st.error(safe_cloud_message(e)); st.stop()
+    available=[u for u in settings()[2] if u!=st.session_state.cloud_user]
+    if available:
+        with st.form('member_form'):
+            target=st.selectbox('Akun kolaborator',available); role=st.selectbox('Peran',['coder1','coder2','hapus'],format_func=lambda x:{'coder1':'Coder 1','coder2':'Coder 2','hapus':'Cabut akses'}[x]); submit=st.form_submit_button('Simpan akses')
+        if submit:
+            try:
+                pid=st.session_state.cloud_pid; user=st.session_state.cloud_user; change_member(pid,user,target,role); result=read_project(pid,user); clear_workspace(); apply_cloud(*result,pid); st.rerun()
+            except Exception as e: st.error(safe_cloud_message(e))
+    else: st.info('Tambahkan akun kolaborator di Streamlit Secrets terlebih dahulu.')
+    st.subheader('Retensi & penghapusan'); st.write('Batas retensi (UTC):',st.session_state.cloud_expiry)
+    st.caption('Data API yang diketahui dibatasi maksimal 30 hari dari koleksi. Proyek kedaluwarsa tidak dapat dibuka dan dihapus ketika daftar proyek dimuat. Aktifkan tugas penghapusan terjadwal pada database untuk penghapusan tanpa menunggu login; cadangan lokal harus dihapus terpisah.')
+    confirm=st.text_input('Untuk menghapus seluruh proyek dari database, ketik nama proyek persis')
+    if st.button('Hapus proyek permanen',disabled=confirm!=project):
+        try: delete_project(st.session_state.cloud_pid,st.session_state.cloud_user,st.session_state.cloud_revision); clear_workspace(); st.rerun()
+        except Exception as e: st.error(safe_cloud_message(e))
     st.stop()
 if page.startswith('07'):
     st.header('Immersion journal & custom codebook')
@@ -370,7 +641,7 @@ if page.startswith('07'):
     with st.form('codebook'):
         edited=st.data_editor(cb,num_rows='dynamic',hide_index=True)
         if st.form_submit_button('Simpan codebook'):
-            st.session_state.codebook=records(edited.fillna('')); audit('Codebook',f'{len(edited)} baris'); st.success('Codebook tersimpan di sesi.')
+            st.session_state.codebook=records(edited.fillna('')); audit('Codebook',f'{len(edited)} baris'); st.success('Codebook tersimpan di database.')
     st.caption('Codebook adalah pedoman pengodean manusia, tidak otomatis melatih model AI.')
     st.stop()
 
@@ -419,9 +690,9 @@ if page.startswith('01'):
                 st.session_state.raw=pd.concat([st.session_state.raw]+batches,ignore_index=True) if batches else st.session_state.raw
                 if 'ID_Sumber' in st.session_state.raw:
                     known=set(st.session_state.data.ID_Sumber.dropna()) if 'ID_Sumber' in st.session_state.data else set()
-                    st.session_state.raw=st.session_state.raw[~st.session_state.raw.ID_Sumber.isin(known)].drop_duplicates('ID_Sumber').reset_index(drop=True)
-                st.session_state.collection_log.extend(log); audit('Koleksi',f'{source}: {len(log)} permintaan')
-                st.session_state.raw_mode=mode
+                    ids=st.session_state.raw.ID_Sumber.fillna('').astype(str)
+                    st.session_state.raw=st.session_state.raw[~((ids!='') & (ids.isin(known)|ids.duplicated()))].reset_index(drop=True)
+                st.session_state.collection_log.extend(log); st.session_state.raw_mode=mode; audit('Koleksi',f'{source}: {len(log)} permintaan')
                 st.dataframe(pd.DataFrame(log),hide_index=True)
         if not st.session_state.raw.empty:
             raw=st.session_state.raw.copy(); st.success(f'{len(raw)} komentar dalam antrean lintas API, belum tentu dianalisis.'); st.dataframe(raw.head(10),hide_index=True)
@@ -441,8 +712,9 @@ if page.startswith('01'):
                 if fingerprint in st.session_state.batch_hashes: raise ValueError('Batch identik sudah ditambahkan.')
                 with st.spinner('Model sedang memproses komentar dan klausa...'):
                     d,a=analyze(raw,load_model(),extra,project,case,source)
-                st.session_state.data=pd.concat([st.session_state.data,d],ignore_index=True); st.session_state.aspects=pd.concat([st.session_state.aspects,a],ignore_index=True); st.session_state.version+=1; st.session_state.batch_hashes.add(fingerprint); audit('Analisis',f'{len(d)} komentar masuk; {before-len(raw)} disaring')
+                st.session_state.data=pd.concat([st.session_state.data,d],ignore_index=True); st.session_state.aspects=pd.concat([st.session_state.aspects,a],ignore_index=True); st.session_state.version+=1; st.session_state.batch_hashes.add(fingerprint)
                 if mode in ('YouTube API','TikTok Research API'): st.session_state.raw=pd.DataFrame()
+                audit('Analisis',f'{len(d)} komentar masuk; {before-len(raw)} disaring')
                 st.success(f'{len(d)} komentar ditambahkan. Buka menu 02 atau 03. Jangan klik ulang untuk batch yang sama.')
             except ValueError as e: st.error(str(e))
             except Exception as e: st.error('Analisis gagal. Periksa format data atau log aplikasi. '+type(e).__name__)
@@ -458,18 +730,20 @@ if page.startswith('08'):
     semantic_page(d); st.stop()
 if page.startswith('02'):
     st.header('Validasi & pengodean')
-    st.caption('Coder harus bekerja independen tanpa melihat prediksi atau label coder lain. Mode di bawah menyembunyikan kolom tersebut, tetapi bukan kontrol akses multiuser.')
-    mode=st.radio('Mode kerja',['Peneliti / pengodean','Coder 1 (buta)','Coder 2 (buta)'],horizontal=True)
+    st.caption('Coder bekerja dengan akun terpisah. Prediksi AI dan label coder lain tidak ditampilkan kepada coder.')
+    mode={'owner':'Peneliti / pengodean','coder1':'Coder 1 (buta)','coder2':'Coder 2 (buta)'}[st.session_state.cloud_role]
+    st.write('Mode kerja: '+mode)
     if mode.startswith('Coder'):
         col='Coder_1' if mode.startswith('Coder 1') else 'Coder_2'; visible=['ID','Komentar','Kasus',col]; editable=[col]
     else:
-        editable=['Relevansi','Sentimen_Restoran','Sentimen_Kreator','Sentimen_Konten','Sentimen_Komunitas','Kode_Peneliti','Kategori_Peneliti','Tema_Peneliti','Catatan']; visible=['ID','Komentar','Kasus','Sumber','Sentimen_AI','Sentimen_Konteks_Saran','Skor_Model','Relevansi_Saran','Aspek_Saran','Kode_Saran','Emosi_Saran']+editable
+        editable=['Relevansi','Sentimen_Restoran','Sentimen_Kreator','Sentimen_Konten','Sentimen_Komunitas','Kode_Peneliti','Kategori_Peneliti','Tema_Peneliti','Catatan']; visible=['ID','Komentar','Kasus','Sumber','Sentimen_AI','Sentimen_Konteks_Saran','Skor_Model','Relevansi_Saran','Aspek_Saran','Kode_Saran','Emosi_Saran','Coder_1','Coder_2']+editable
     if mode=='Peneliti / pengodean' and st.session_state.semantic:
         st.subheader('Saran AI semantik (referensi, bukan label final)')
         st.dataframe(pd.DataFrame(st.session_state.semantic).merge(d[['ID','Komentar']],on='ID',how='inner'),hide_index=True,column_config={'ID':None})
     config={c:st.column_config.SelectboxColumn(c,options=[PENDING]+LABELS+(['Tidak berlaku'] if c.startswith('Sentimen') else [])) for c in editable if c.startswith(('Coder','Sentimen'))}; config['ID']=st.column_config.TextColumn('ID',width='small'); config['Komentar']=st.column_config.TextColumn('Komentar',width='large'); config['Relevansi']=st.column_config.SelectboxColumn('Relevansi',options=REL)
+    display=d[visible].copy(); display.insert(0,'Kode_komentar',[f'C{i+1:05d}' for i in range(len(display))]); config['ID']=None; config['Kode_komentar']=st.column_config.TextColumn('Kode',width='small')
     with st.form('validation'):
-        edited=st.data_editor(d[visible],disabled=[c for c in visible if c not in editable],column_config=config,hide_index=True,key=f'edit_{mode}_{st.session_state.version}')
+        edited=st.data_editor(display,disabled=[c for c in display if c not in editable],column_config=config,hide_index=True,key=f'edit_{mode}_{st.session_state.version}')
         if st.form_submit_button('Simpan pengodean'):
             for c in editable: d[c]=edited[c].values
             st.session_state.data=d; audit('Pengodean',mode); st.session_state.version+=1; st.rerun()
@@ -567,11 +841,11 @@ elif page.startswith('05'):
             st.dataframe(pd.DataFrame([{'Model':name,'N':len(paired),'Accuracy':(paired.Coder_1==paired[col]).mean(),'Macro F1':f1_score(paired.Coder_1,paired[col],labels=LABELS[:3],average='macro',zero_division=0)} for name,col in [('RoBERTa','Sentimen_AI'),('Semantik','sentimen')]]),hide_index=True)
     if not cm.empty: st.subheader('Confusion matrix (baris: manusia, kolom: AI)'); st.dataframe(cm); st.dataframe(report)
 else:
-    st.header('Pusat ekspor'); st.download_button('Cadangan proyek JSON',snapshot(project),'NetnoSense_6_project.json',mime='application/json'); st.caption('Ekspor mencakup dataset lengkap dan ringkasan sesuai cakupan yang dipilih. Pastikan data telah dianonimkan sesuai etika dan ketentuan API sebelum disimpan atau dibagikan.')
+    st.header('Pusat ekspor'); st.download_button('Cadangan proyek JSON',snapshot(project),'NetnoSense_7_project.json',mime='application/json'); st.caption('Ekspor mencakup dataset lengkap dan ringkasan sesuai cakupan yang dipilih. Pastikan data telah dianonimkan sesuai etika dan ketentuan API sebelum disimpan atau dibagikan.')
     tables={'Dataset':d,'Cakupan':scope,'Ringkasan':summary,'Antarkasus':cross,'Aspek':a,'Perilaku':behavior_counts,'Emosi':emotion_counts,'Unigram':freqs[1],'Bigram':freqs[2],'Trigram':freqs[3],'Evaluasi':metrics,'Confusion_matrix':cm.reset_index(),'Metrik_per_kelas':report.reset_index(),'Log_koleksi':pd.DataFrame(st.session_state.collection_log),'Jurnal':pd.DataFrame(st.session_state.journal),'Codebook':pd.DataFrame(st.session_state.codebook),'Audit':pd.DataFrame(st.session_state.audit),'Antrean':st.session_state.raw,'AI_semantik':pd.DataFrame(st.session_state.semantic),'Evidence_mapping':pd.DataFrame(st.session_state.semantic).merge(d[['ID','Kasus','Komentar']],on='ID',how='inner') if st.session_state.semantic else pd.DataFrame()}
     buf=io.BytesIO()
     with pd.ExcelWriter(buf,engine='openpyxl') as writer:
         for name,table in tables.items(): table.map(safe_cell).to_excel(writer,sheet_name=name,index=False)
-    st.download_button('Unduh seluruh hasil Excel',buf.getvalue(),'NetnoSense_PRO_6.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-    text='NETNOSENSE PRO 6.0 — LAPORAN DESKRIPTIF\n'+f'Proyek: {project}\nCakupan: {filter_mode}\nN: {len(scope)} / {len(d)}\n'+summary.to_string(index=False)+'\n\n'+cross.to_string(index=False)+'\n\nMetrik model:\n'+metrics.to_string(index=False)+'\n\nBatasan: prediksi dan pengodean otomatis bersifat sementara. Komentar tidak membuktikan perubahan kunjungan atau hubungan kausal.'
-    st.download_button('Unduh laporan TXT',text.encode('utf-8'),'laporan_v6.txt'); st.text(text)
+    st.download_button('Unduh seluruh hasil Excel',buf.getvalue(),'NetnoSense_PRO_7.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    text='NETNOSENSE PRO 7.0 — LAPORAN DESKRIPTIF\n'+f'Proyek: {project}\nCakupan: {filter_mode}\nN: {len(scope)} / {len(d)}\n'+summary.to_string(index=False)+'\n\n'+cross.to_string(index=False)+'\n\nMetrik model:\n'+metrics.to_string(index=False)+'\n\nBatasan: prediksi dan pengodean otomatis bersifat sementara. Komentar tidak membuktikan perubahan kunjungan atau hubungan kausal.'
+    st.download_button('Unduh laporan TXT',text.encode('utf-8'),'laporan_v7.txt'); st.text(text)
