@@ -172,7 +172,7 @@ def evaluate(d):
     if len(valid):
         y=valid.Coder_1; p=valid.Sentimen_AI
         met.append({'Metrik':'Accuracy (3 kelas)','Nilai':float((y==p).mean()),'N':len(valid)})
-        cm=pd.DataFrame(confusion_matrix(y,p,labels=LABELS[:3]),index=LABELS[:3],columns=LABELS[:3]); report=pd.DataFrame(classification_report(y,p,labels=LABELS[:3],output_dict=True,zero_division=0)).T
+        cm=pd.DataFrame(confusion_matrix(y,p,labels=LABELS[:3]),index=LABELS[:3],columns=LABELS[:3]); report=pd.DataFrame({k:v for k,v in classification_report(y,p,labels=LABELS[:3],output_dict=True,zero_division=0).items() if isinstance(v,dict)}).T
     if len(pairs) and len(set(pairs.Coder_1)|set(pairs.Coder_2))>1:
         met.append({'Metrik':'Cohen Kappa','Nilai':float(cohen_kappa_score(pairs.Coder_1,pairs.Coder_2,labels=LABELS)),'N':len(pairs)})
     return pd.DataFrame(met,columns=['Metrik','Nilai','N']),cm,report
@@ -204,12 +204,12 @@ def records(frame):
 
 def snapshot(project):
     q=st.session_state
-    obj={'schema':7,'semantic':q.semantic,'project':project,'data':records(q.data),'aspects':records(q.aspects),'raw':records(q.raw),'collection_log':q.collection_log,'journal':q.journal,'codebook':q.codebook,'audit':q.audit,'stopwords':q.stopwords,'stemming':q.stemming,'raw_mode':q.raw_mode,'raw_registry':q.raw_registry,'batch_hashes':list(q.batch_hashes)}
+    obj={'schema':8,'publication':q.get('publication',publication_defaults()),'semantic':q.semantic,'project':project,'data':records(q.data),'aspects':records(q.aspects),'raw':records(q.raw),'collection_log':q.collection_log,'journal':q.journal,'codebook':q.codebook,'audit':q.audit,'stopwords':q.stopwords,'stemming':q.stemming,'raw_mode':q.raw_mode,'raw_registry':q.raw_registry,'batch_hashes':list(q.batch_hashes)}
     return json.dumps(obj,ensure_ascii=False,allow_nan=False).encode('utf-8')
 
 def decode_snapshot(blob):
     obj=json.loads(blob)
-    if not isinstance(obj,dict) or obj.get('schema') not in (5,6,7): raise ValueError('Gunakan cadangan JSON NetnoSense 5.0, 6.0 atau 7.0.')
+    if not isinstance(obj,dict) or obj.get('schema') not in (5,6,7,8): raise ValueError('Gunakan cadangan JSON NetnoSense 5.0, 6.0, 7.0 atau 8.0.')
     if not isinstance(obj.get('project'),str) or not obj['project'].strip(): raise ValueError('Nama proyek tidak valid.')
     out={}
     for k in ('data','aspects','raw'):
@@ -231,6 +231,7 @@ def decode_snapshot(blob):
     if not isinstance(sem,list) or any(not isinstance(r,dict) or not {'ID','sentimen','tema'}<=set(r) for r in sem): raise ValueError('Data semantik tidak valid.')
     if len({r['ID'] for r in sem})!=len(sem) or any(r['ID'] not in set(d.get('ID',[])) for r in sem): raise ValueError('ID semantik tidak cocok.')
     out['semantic']=sem
+    out['publication']=decode_publication(obj.get('publication',{}))
     return out
 
 @st.cache_resource
@@ -361,7 +362,7 @@ def db():
     return psycopg.connect(dsn,connect_timeout=10,sslmode=mode,prepare_threshold=None)
 
 def empty_payload(name):
-    return {'schema':7,'project':name,'data':[],'aspects':[],'raw':[],'collection_log':[],'journal':[],'codebook':[],'audit':[], 'stopwords':DEFAULTS['stopwords'],'stemming':False,'raw_mode':'','raw_registry':{},'batch_hashes':[],'semantic':[]}
+    return {'schema':8,'publication':publication_defaults(),'project':name,'data':[],'aspects':[],'raw':[],'collection_log':[],'journal':[],'codebook':[],'audit':[], 'stopwords':DEFAULTS['stopwords'],'stemming':False,'raw_mode':'','raw_registry':{},'batch_hashes':[],'semantic':[]}
 
 def access_role(cur,pid,user,lock=False):
     # Serialize writes and membership changes on the parent row.
@@ -501,7 +502,7 @@ def login_signature(token): return hashlib.sha256(token.encode()).hexdigest()
 def cloud_gate():
     q=st.session_state; cfg=settings()
     if not cfg:
-        st.header('Konfigurasi NetnoSense PRO 7.0'); st.info('Database dan akun belum dikonfigurasi. Ikuti PANDUAN.txt: jalankan database.sql di Supabase, lalu masukkan konfigurasi ke Streamlit Secrets. Tidak ada data penelitian yang dibuka sebelum login.'); st.stop()
+        st.header('Konfigurasi NetnoSense PRO 8.0'); st.info('Database dan akun belum dikonfigurasi. Ikuti PANDUAN.txt: jalankan database.sql di Supabase, lalu masukkan konfigurasi ke Streamlit Secrets. Tidak ada data penelitian yang dibuka sebelum login.'); st.stop()
     _,admin,accounts=cfg
     if q.get('cloud_user') not in accounts or not hmac.compare_digest(str(q.get('cloud_signature','')),login_signature(accounts.get(q.get('cloud_user'),''))):
         if q.get('cloud_user'): clear_workspace(False)
@@ -531,7 +532,7 @@ def cloud_gate():
         if q.get('cloud_dirty'):
             st.warning('Perubahan lokal belum tersimpan. Simpan ulang bila memungkinkan atau muat ulang setelah mencadangkan perubahan.')
             if q.get('cloud_message'): st.error(q.cloud_message)
-            if role=='owner' and q.get('cloud_dirty'): st.download_button('Unduh cadangan lokal sebelum memuat ulang',snapshot(q.project_name),'recovery_7.json',mime='application/json')
+            if role=='owner' and q.get('cloud_dirty'): st.download_button('Unduh cadangan lokal sebelum memuat ulang',snapshot(q.project_name),'recovery_8.json',mime='application/json')
             if role!='owner':
                 col={'coder1':'Coder_1','coder2':'Coder_2'}[role]; st.download_button('Unduh label lokal Anda (CSV)',q.data[['ID',col]].map(safe_cell).to_csv(index=False).encode('utf-8-sig'),'label_lokal.csv')
             if (rev==q.cloud_revision or role!='owner') and st.button('Coba simpan lagi'):
@@ -577,27 +578,443 @@ def cloud_gate():
     st.stop()
 
 
-st.set_page_config(page_title='NetnoSense PRO 7.0',page_icon='📊',layout='wide')
+# V8: publication workspace; local computation, no generative API required.
+PUB_TEXT_FIELDS = {
+    'title':'Judul artikel', 'authors':'Penulis dan afiliasi', 'abstract':'Abstrak (ditulis peneliti)',
+    'keywords':'Kata kunci', 'introduction':'Pendahuluan dan research gap',
+    'literature':'Landasan teori dan literatur', 'question':'Pertanyaan penelitian',
+    'methods':'Metode: desain, pemilihan kasus, konteks dan prosedur',
+    'findings':'Interpretasi temuan dan bukti tekstual yang telah diperiksa',
+    'discussion':'Pembahasan terhadap literatur', 'contribution':'Kontribusi teoretis',
+    'implications':'Implikasi manajerial', 'limitations':'Keterbatasan',
+    'conclusion':'Kesimpulan', 'ethics':'Etika, izin, dan perlindungan data',
+    'availability':'Data availability statement', 'funding':'Pendanaan dan konflik kepentingan',
+    'ai_disclosure':'Pengungkapan penggunaan AI / perangkat lunak'
+}
+PUB_CHECKS = [
+    'Izin etik, platform, penyimpanan dan ekspor telah diperiksa',
+    'Pemilihan kasus dan periode koleksi terdokumentasi',
+    'Kriteria inklusi/eksklusi dan konteks video terdokumentasi',
+    'Dua coder berbeda bekerja independen; label latihan tidak digunakan',
+    'Codebook, pelatihan, dan penyelesaian perbedaan terdokumentasi',
+    'Evaluasi model memakai label referensi dan cakupan yang dijelaskan',
+    'Tema ditelaah bersama konteks, memo refleksif dan kasus menyimpang',
+    'Kutipan telah diperiksa anonimitas dan izin penggunaannya',
+    'Research gap dan kontribusi diperiksa terhadap literatur aktual',
+    'Referensi, klaim, dan sitasi naskah telah diverifikasi',
+    'Keterbatasan, retensi, dan pengungkapan AI telah dinyatakan',
+    'Format dan ketentuan jurnal tujuan telah diperiksa'
+]
+MAP_COLS=['Tema','ID_Bukti','Teori_Konstruk','ID_Referensi','Interpretasi','Penjelasan_alternatif']
+EDGE_COLS=['Dari','Ke','Hubungan_usulan','ID_Bukti','Alasan']
+REF_COLS=['ID_Referensi','Penulis_APA','Tahun','Judul','Sumber_APA','DOI_URL','Terverifikasi']
+
+def publication_defaults():
+    return {'manuscript':{},'theory':[],'edges':[],'references':[], 'adjudication':{},'checks':[], 'checks_basis':'','independent':False,'independent_basis':''}
+
+def decode_publication(value):
+    # New metadata is optional for old snapshots. Reject malformed additions rather than silently dropping them.
+    if not isinstance(value,dict): raise ValueError('Metadata publikasi tidak valid.')
+    p=publication_defaults()
+    m=value.get('manuscript',{})
+    if not isinstance(m,dict) or any(k not in PUB_TEXT_FIELDS or not isinstance(v,str) or len(v)>50000 for k,v in m.items()): raise ValueError('Draf artikel tidak valid.')
+    p['manuscript']=m
+    for key,cols in [('theory',MAP_COLS),('edges',EDGE_COLS),('references',REF_COLS)]:
+        rows=value.get(key,[])
+        if not isinstance(rows,list) or len(rows)>2000: raise ValueError('Tabel publikasi tidak valid.')
+        for r in rows:
+            if not isinstance(r,dict) or any(k not in cols for k in r): raise ValueError('Kolom publikasi tidak valid.')
+            if any((not isinstance(v,bool) if k=='Terverifikasi' else not isinstance(v,str) or len(v)>10000) for k,v in r.items()): raise ValueError('Nilai publikasi tidak valid.')
+        p[key]=rows
+    refs=p['references']; ids=[r.get('ID_Referensi','') for r in refs]
+    if any(not x for x in ids) or len(ids)!=len(set(ids)): raise ValueError('ID referensi kosong atau berulang.')
+    a=value.get('adjudication',{})
+    if not isinstance(a,dict) or any(not isinstance(k,str) or not isinstance(v,dict) or v.get('label') not in LABELS or not isinstance(v.get('basis'),str) or not isinstance(v.get('reason'),str) or not v['reason'].strip() or len(v['reason'])>4000 for k,v in a.items()): raise ValueError('Adjudikasi tidak valid.')
+    p['adjudication']={k:{'label':v['label'],'basis':v['basis'],'reason':v['reason']} for k,v in a.items()}
+    checks=value.get('checks',[])
+    if not isinstance(checks,list) or any(x not in PUB_CHECKS for x in checks): raise ValueError('Checklist tidak valid.')
+    p['checks']=list(dict.fromkeys(checks))
+    for key in ('checks_basis','independent_basis'):
+        if not isinstance(value.get(key,''),str): raise ValueError('Versi pemeriksaan tidak valid.')
+        p[key]=value.get(key,'')
+    if not isinstance(value.get('independent',False),bool): raise ValueError('Konfirmasi coder tidak valid.')
+    p['independent']=value.get('independent',False)
+    return p
+
+def pub_hash(value):
+    return hashlib.sha256(json.dumps(value,sort_keys=True,ensure_ascii=False,default=str).encode()).hexdigest()
+
+def label_basis(row):
+    return pub_hash([str(row.get(k,'')) for k in ('ID','Komentar','Coder_1','Coder_2')])
+
+def coder_basis(d):
+    return pub_hash(sorted(label_basis(r) for r in d.to_dict('records')))
+
+def independent_ok(d,p):
+    return bool(p['independent'] and p['independent_basis']==coder_basis(d))
+
+def publication_data(d,p):
+    # Never use AI fallback as a reference label. Recompute on each read.
+    out=d.copy()
+    out['Kode_Bukti']=['C'+str(i+1).zfill(5) for i in range(len(out))]
+    labels=[]; status=[]
+    for row in out.to_dict('records'):
+        c1,c2=row.get('Coder_1'),row.get('Coder_2'); a=p['adjudication'].get(str(row['ID']),{})
+        if c1 not in LABELS or c2 not in LABELS: label,why='', 'Belum dinilai berpasangan'
+        elif c1==c2: label,why=c1,'Sepakat'
+        elif a.get('basis')==label_basis(row) and a.get('label') in LABELS and a.get('reason','').strip(): label,why=a['label'],'Adjudikasi'
+        else: label,why='', 'Perbedaan belum diselesaikan'
+        labels.append(label); status.append(why)
+    out['Label_Referensi']=labels; out['Status_Referensi']=status
+    return out
+
+def human_scope(d,p):
+    result=publication_data(d,p)
+    if not independent_ok(d,p): return result.iloc[0:0].copy()
+    return result[result.Relevansi.eq('Relevan') & result.Label_Referensi.isin(LABELS)].copy()
+
+def split_tags(value):
+    if pd.isna(value): return []
+    return list(dict.fromkeys(x.strip() for x in str(value).split(';') if x.strip() and x.strip() not in (UNKNOWN,PENDING)))
+
+def theme_matrix(scope):
+    # Unit = distinct comment per theme. Multiple themes per comment permitted.
+    rows=[]; evidence=[]
+    for r in scope.to_dict('records'):
+        for theme in split_tags(r.get('Tema_Peneliti','')):
+            evidence.append({'Tema':theme,'ID_Bukti':r['Kode_Bukti'],'ID':r['ID'],'Kasus':r['Kasus'],'Kode':r.get('Kode_Peneliti',''),'Kategori':r.get('Kategori_Peneliti',''),'Label_Referensi':r['Label_Referensi'],'Komentar':r['Komentar']})
+    ev=pd.DataFrame(evidence,columns=['Tema','ID_Bukti','ID','Kasus','Kode','Kategori','Label_Referensi','Komentar'])
+    for theme,g in ev.groupby('Tema',sort=True):
+        rows.append({'Tema':theme,'N_komentar':g.ID.nunique(),'N_kasus':g.Kasus.nunique(),'Kategori':'; '.join(sorted(set(x for v in g.Kategori for x in split_tags(v)))),'Contoh_ID':', '.join(g.ID_Bukti.head(5))})
+    return pd.DataFrame(rows,columns=['Tema','N_komentar','N_kasus','Kategori','Contoh_ID']),ev
+
+def candidate_matrix(d):
+    rows=[]
+    for r in d.to_dict('records'):
+        for code in split_tags(r.get('Kode_Saran','')):
+            rows.append({'Kode_kandidat':code,'Kasus':r['Kasus'],'ID':r['ID']})
+    t=pd.DataFrame(rows,columns=['Kode_kandidat','Kasus','ID'])
+    return t.groupby(['Kode_kandidat','Kasus']).ID.nunique().reset_index(name='N_komentar')
+
+def reference_metrics(scope):
+    # Compare original 3-class model to agreed/adjudicated 3-class human reference.
+    eligible=scope[scope.Label_Referensi.isin(LABELS[:3])].copy()
+    if eligible.empty: return pd.DataFrame(columns=['Metrik','Nilai','N']),pd.DataFrame(),pd.DataFrame()
+    from sklearn.metrics import accuracy_score, f1_score
+    y=eligible.Label_Referensi; pred=eligible.Sentimen_AI
+    # A prediction outside the three reference classes remains an error.
+    pred=pred.where(pred.isin(LABELS[:3]),'Di luar 3 kelas')
+    labels=LABELS[:3]+['Di luar 3 kelas']
+    cm=pd.DataFrame(confusion_matrix(y,pred,labels=labels),index=labels,columns=labels).iloc[:3]
+    rep=pd.DataFrame({k:v for k,v in classification_report(y,pred,labels=LABELS[:3],output_dict=True,zero_division=0).items() if isinstance(v,dict)}).T
+    metrics=pd.DataFrame([{'Metrik':'Accuracy (referensi manusia 3 kelas)','Nilai':accuracy_score(y,pred),'N':len(y)},{'Metrik':'Macro F1 (3 kelas tetap)','Nilai':f1_score(y,pred,labels=LABELS[:3],average='macro',zero_division=0),'N':len(y)}])
+    return metrics,cm,rep
+
+def parse_comment_time(v):
+    if pd.isna(v) or not str(v).strip(): return pd.NaT
+    s=str(v).strip()
+    try:
+        if re.fullmatch(r'\d{10}(?:\.0+)?',s): return pd.to_datetime(float(s),unit='s',utc=True,errors='coerce')
+        if re.fullmatch(r'\d{13}(?:\.0+)?',s): return pd.to_datetime(float(s),unit='ms',utc=True,errors='coerce')
+        if re.fullmatch(r'\d+',s): return pd.NaT
+        t=pd.Timestamp(s)
+        # Reject ambiguous timestamps without timezone rather than assume local clock.
+        return t.tz_convert('UTC') if t.tzinfo else pd.NaT
+    except (ValueError,TypeError,OverflowError): return pd.NaT
+
+def trend_table(d,label,frequency='D'):
+    if d.empty or 'Waktu_komentar' not in d: return pd.DataFrame(columns=['Periode_UTC','Sentimen','Jumlah','N_periode','Persen']),len(d)
+    x=d[['Waktu_komentar',label]].copy(); x['Tanggal']=pd.to_datetime(x.Waktu_komentar.map(parse_comment_time),utc=True,errors='coerce')
+    x=x[x.Tanggal.notna()].copy(); missing=len(d)-len(x)
+    if x.empty: return pd.DataFrame(columns=['Periode_UTC','Sentimen','Jumlah','N_periode','Persen']),missing
+    x['Periode_UTC']=x.Tanggal.dt.tz_localize(None).dt.to_period(frequency).astype(str)
+    t=x.groupby(['Periode_UTC',label]).size().unstack(fill_value=0).reindex(columns=LABELS,fill_value=0).stack().rename('Jumlah').reset_index().rename(columns={label:'Sentimen'})
+    t['N_periode']=t.groupby('Periode_UTC').Jumlah.transform('sum'); t['Persen']=100*t.Jumlah/t.N_periode
+    return t,missing
+
+def pub_cross(scope):
+    t=scope.groupby(['Kasus','Label_Referensi']).size().unstack(fill_value=0).reindex(columns=LABELS,fill_value=0)
+    t['Total']=t.sum(axis=1)
+    return t.reset_index()
+
+def pub_flow(d,p):
+    x=publication_data(d,p)
+    return pd.DataFrame([('Dataset tersimpan',len(x)),('Relevan terkonfirmasi',int(x.Relevansi.eq('Relevan').sum())),('Eksklusi terkonfirmasi',int(x.Relevansi.isin(['Tidak relevan','Spam/promosi']).sum())),('Relevansi belum dipastikan',int(x.Relevansi.isin(['Belum diperiksa','Ambigu']).sum())),('Dua label tersedia (semua relevansi)',int((x.Coder_1.isin(LABELS)&x.Coder_2.isin(LABELS)).sum())),('Relevan dan label referensi tersedia (termasuk belum dikonfirmasi independensi)',int((x.Relevansi.eq('Relevan')&x.Label_Referensi.isin(LABELS)).sum())),('Cakupan publikasi (independensi dikonfirmasi)',len(human_scope(d,p)))],columns=['Tahap','N'])
+
+def pub_reference_lines(p,verified_only=True):
+    result=[]
+    for r in p['references']:
+        if verified_only and not r.get('Terverifikasi'): continue
+        # Field Sumber_APA is entered in APA form by researcher, not inferred.
+        line=f"{r.get('Penulis_APA','')} ({r.get('Tahun','n.d.')}). {r.get('Judul','').rstrip('.')}. {r.get('Sumber_APA','')} {r.get('DOI_URL','')}".strip()
+        result.append((r['ID_Referensi'],line))
+    return sorted(result,key=lambda z:z[1].casefold())
+
+def mapping_issues(p,scope):
+    # Use stable IDs in saved mappings; human display code is convenience only.
+    ids=set(scope.ID.astype(str)); ref_ids={r['ID_Referensi'] for r in p['references'] if r.get('Terverifikasi')}
+    theme,ev=theme_matrix(scope); themes=set(theme.Tema)
+    issues=[]
+    for i,r in enumerate(p['theory'],1):
+        evidence=split_tags(r.get('ID_Bukti','')); refs=split_tags(r.get('ID_Referensi',''))
+        valid_for_theme=set(ev.loc[ev.Tema.eq(r.get('Tema','')),'ID'].astype(str))
+        if r.get('Tema') not in themes or not evidence or not set(evidence)<=valid_for_theme or not refs or not set(refs)<=ref_ids or not r.get('Interpretasi','').strip() or not r.get('Teori_Konstruk','').strip(): issues.append(f'Pemetaan teori baris {i}: periksa tema, ID bukti, referensi terverifikasi dan interpretasi.')
+    for i,r in enumerate(p['edges'],1):
+        evidence=split_tags(r.get('ID_Bukti',''))
+        if not r.get('Dari','').strip() or not r.get('Ke','').strip() or r.get('Dari')==r.get('Ke') or not evidence or not set(evidence)<=ids or not r.get('Alasan','').strip() or not r.get('Hubungan_usulan','').strip(): issues.append(f'Kerangka baris {i}: periksa konstruk, bukti dan alasan hubungan.')
+    return issues
+
+def readiness_basis(d,p):
+    # Invalidate self-reported checklist after changes to substantive data or manuscript.
+    meta={k:p[k] for k in ('manuscript','theory','edges','references','adjudication','independent','independent_basis')}
+    return pub_hash([records(d),meta])
+
+def publication_findings(d,p):
+    scope=human_scope(d,p); out=[f'Dataset tersimpan: {len(d)} komentar. Unit analisis: komentar, bukan pengguna unik.']
+    if scope.empty:
+        return out+['Belum ada cakupan publikasi yang memenuhi syarat: relevansi manusia, dua label yang sepakat/teradjudikasi, dan konfirmasi independensi. Tidak ada temuan final otomatis.']
+    out.append(f'Cakupan publikasi: {len(scope)} komentar dari {scope.Kasus.nunique()} kasus; tidak mewakili semua konsumen.')
+    counts=scope.Label_Referensi.value_counts().reindex(LABELS,fill_value=0)
+    out.append('Distribusi label referensi manusia: '+ '; '.join(f'{k} {v} ({v/len(scope):.1%})' for k,v in counts.items())+'.')
+    themes,ev=theme_matrix(scope)
+    coded=ev.ID.nunique()
+    out.append(f'Tema manusia tercatat pada {coded} dari {len(scope)} komentar dalam cakupan. Frekuensi tema adalah jumlah komentar berkode, bukan ukuran kepentingan tema.')
+    if not themes.empty:
+        out.append('Tema tercatat: '+ '; '.join(f'{r.Tema} ({r.N_komentar} komentar)' for r in themes.itertuples())+'.')
+    out.append('Keluaran ini bersifat deskriptif. Komentar tidak membuktikan perubahan kunjungan aktual, hubungan sebab-akibat, atau generalisasi populasi.')
+    return out
+
+def publication_docx(d,p,project,include_evidence=False):
+    from docx import Document
+    from docx.shared import Inches,Pt
+    doc=Document(); sec=doc.sections[0]; sec.top_margin=sec.bottom_margin=Inches(.8); sec.left_margin=sec.right_margin=Inches(.85)
+    doc.styles['Normal'].font.name='Calibri'; doc.styles['Normal'].font.size=Pt(11)
+    doc.add_heading(p['manuscript'].get('title') or project,0)
+    doc.add_paragraph('DRAF KERJA — belum siap submit. Verifikasi seluruh klaim, referensi, etika dan format jurnal.')
+    doc.add_paragraph(p['manuscript'].get('authors','') or '[Penulis dan afiliasi]')
+    m=p['manuscript']; scope=human_scope(d,p)
+    def section(key):
+        doc.add_heading(PUB_TEXT_FIELDS[key],1); doc.add_paragraph(m.get(key,'').strip() or '[Belum diisi peneliti]')
+    for k in ('abstract','keywords','introduction','literature','question','methods'): section(k)
+    doc.add_heading('Hasil deskriptif berbasis data',1)
+    for x in publication_findings(d,p): doc.add_paragraph(x)
+    def add_table(title,t):
+        if t.empty: return
+        doc.add_heading(title,2); table=doc.add_table(rows=1,cols=len(t.columns)); table.style='Table Grid'
+        for cell,name in zip(table.rows[0].cells,t.columns): cell.text=str(name)
+        for row in t.itertuples(index=False,name=None):
+            for cell,v in zip(table.add_row().cells,row): cell.text=f'{v:.4f}' if isinstance(v,float) else str(v)
+    add_table('Cakupan dan seleksi komentar',pub_flow(d,p))
+    if not scope.empty:
+        add_table('Distribusi antarkasus',pub_cross(scope))
+        themes,ev=theme_matrix(scope); add_table('Matriks tema manusia',themes)
+        met,_,_=reference_metrics(scope); add_table('Evaluasi terhadap label referensi',met)
+        paired=publication_data(d,p); paired=paired[paired.Relevansi.eq('Relevan')]
+        kappa,_,_=evaluate(paired); add_table('Kesepakatan coder sebelum adjudikasi',kappa[kappa.Metrik.eq('Cohen Kappa')])
+        if include_evidence and not ev.empty: add_table('Indeks bukti (tanpa kutipan teks)',ev[['Tema','ID_Bukti','Kasus']].head(100))
+    for k in ('findings','discussion','contribution','implications','limitations','conclusion','ethics','availability','funding','ai_disclosure'): section(k)
+    doc.add_heading('Daftar pustaka — entri yang dikonfirmasi peneliti',1)
+    refs=pub_reference_lines(p)
+    for _,line in refs: doc.add_paragraph(line)
+    if not refs: doc.add_paragraph('[Belum ada referensi terverifikasi]')
+    doc.add_paragraph('Format APA 7 perlu pemeriksaan manual, termasuk jenis sumber, kapitalisasi, dan huruf miring.')
+    buf=io.BytesIO(); doc.save(buf); return buf.getvalue()
+
+
+def pub_editor(rows,cols,key):
+    df=pd.DataFrame(rows,columns=cols)
+    config={}
+    for c in cols:
+        if c=='Terverifikasi': df[c]=df[c].fillna(False).astype(bool); config[c]=st.column_config.CheckboxColumn(c,default=False)
+        else: df[c]=df[c].fillna('').astype(str); config[c]=st.column_config.TextColumn(c)
+    out=st.data_editor(df,column_config=config,hide_index=True,num_rows='dynamic',key=key)
+    result=[]
+    for row in out.to_dict('records'):
+        r={c:(bool(row[c]) if c=='Terverifikasi' and pd.notna(row[c]) else False if c=='Terverifikasi' else str(row[c]).strip() if pd.notna(row[c]) else '') for c in cols}
+        if any(r[c] for c in cols if c!='Terverifikasi'): result.append(r)
+    return result
+
+def save_pub(p,action):
+    if st.session_state.cloud_role!='owner': st.error('Hanya pemilik proyek.'); st.stop()
+    try: clean=decode_publication(p)
+    except ValueError as e: st.error(str(e)); return
+    st.session_state.publication=clean; audit('Publikasi',action); st.session_state.version+=1; st.success('Disimpan ke database.'); st.rerun()
+
+def pub_csv(table,label,name):
+    st.download_button(label,table.map(safe_cell).to_csv(index=False).encode('utf-8-sig'),name,mime='text/csv')
+
+def chart_png(table,kind):
+    # Figure object, not global pyplot; available offline.
+    from matplotlib.figure import Figure
+    fig=Figure(figsize=(8,4.6),layout='constrained'); ax=fig.subplots()
+    if kind=='sentiment':
+        ax.bar(table['Sentimen'],table['Jumlah'],color=[COLORS.get(x,'#64748b') for x in table.Sentimen]); ax.set_ylabel('Jumlah komentar'); ax.tick_params(axis='x',rotation=20)
+    else:
+        t=table.set_index('Kasus'); values=t[LABELS].div(t.Total,axis=0)*100; bottom=[0.0]*len(t)
+        for lab in LABELS:
+            vals=values[lab].tolist(); ax.bar(t.index,vals,bottom=bottom,label=lab,color=COLORS[lab]); bottom=[a+b for a,b in zip(bottom,vals)]
+        ax.set_ylabel('Persen dalam kasus'); ax.set_ylim(0,100); ax.legend(loc='upper left',bbox_to_anchor=(1.01,1),fontsize=8); ax.tick_params(axis='x',rotation=30)
+    ax.set_title('Label referensi manusia — cakupan publikasi'); buf=io.BytesIO(); fig.savefig(buf,format='png',dpi=300); return buf.getvalue()
+
+
+def publication_analysis_page(d):
+    p=copy.deepcopy(st.session_state.publication); x=publication_data(d,p); scope=human_scope(d,p)
+    st.header('Analisis publikasi'); st.caption('Tanpa OpenAI API · label manusia dan saran otomatis dipisahkan.')
+    cols=st.columns(4)
+    for col,label,val in zip(cols,['Dataset','Relevan','Label berpasangan','Cakupan publikasi'],[len(x),int(x.Relevansi.eq('Relevan').sum()),int((x.Coder_1.isin(LABELS)&x.Coder_2.isin(LABELS)).sum()),len(scope)]): col.metric(label,val)
+    st.dataframe(pub_flow(d,p),hide_index=True)
+    tabs=st.tabs(['Referensi manusia','Matriks tematik','Tren & antarkasus','Eksplorasi perilaku'])
+    with tabs[0]:
+        st.caption('Isi relevansi dan tema pada menu 02. Dua coder menilai secara terpisah. Label sepakat atau adjudikasi bukan jaminan kebenaran; rujukan ini hanya untuk evaluasi terstruktur.')
+        with st.form('pub_independent'):
+            confirmed=st.checkbox('Saya mengonfirmasi label yang ada berasal dari dua coder berbeda yang bekerja independen, bukan label simulasi.',value=independent_ok(d,p))
+            if st.form_submit_button('Simpan konfirmasi independensi'):
+                p['independent']=confirmed; p['independent_basis']=coder_basis(d) if confirmed else ''; save_pub(p,'Konfirmasi independensi diperbarui')
+        if not independent_ok(d,p): st.warning('Cakupan publikasi dikunci sampai independensi dikonfirmasi. Konfirmasi perlu diperbarui jika dataset atau label coder berubah.')
+        differences=x[x.Status_Referensi.eq('Perbedaan belum diselesaikan') | x.Status_Referensi.eq('Adjudikasi')]
+        if not differences.empty:
+            ids=differences.ID.astype(str).tolist(); names=dict(zip(differences.ID.astype(str),differences.Kode_Bukti))
+            rid=st.selectbox('Komentar dengan label berbeda',ids,format_func=lambda i:names[i]); row=differences[differences.ID.astype(str)==rid].iloc[0]
+            st.write(row.Komentar); st.write(f"Coder 1: {row.Coder_1} | Coder 2: {row.Coder_2}")
+            old=p['adjudication'].get(rid,{}) if row.Status_Referensi=='Adjudikasi' else {}
+            with st.form('pub_adjudicate_'+rid):
+                chosen=st.selectbox('Label referensi setelah rekonsiliasi',[PENDING]+LABELS,index=([PENDING]+LABELS).index(old.get('label',PENDING)))
+                reason=st.text_area('Alasan keputusan (hasil diskusi / penilai ketiga)',old.get('reason',''),max_chars=4000)
+                if st.form_submit_button('Simpan keputusan'):
+                    if chosen==PENDING: p['adjudication'].pop(rid,None)
+                    elif not reason.strip(): st.error('Isi alasan keputusan.') ; st.stop()
+                    else: p['adjudication'][rid]={'label':chosen,'reason':reason.strip(),'basis':label_basis(row)}
+                    save_pub(p,'Keputusan referensi '+names[rid])
+        st.dataframe(x[['Kode_Bukti','Kasus','Relevansi','Coder_1','Coder_2','Label_Referensi','Status_Referensi']],hide_index=True)
+        if not scope.empty:
+            met,cm,rep=reference_metrics(scope); st.subheader('Evaluasi model dengan referensi manusia'); st.caption('Hanya tiga kelas referensi dasar; kelas campuran dan tidak ditentukan tidak masuk N. Prediksi di luar kelas tetap salah. Bukan otomatis sampel uji independen dari proses pengembangan.')
+            st.dataframe(met,hide_index=True); st.dataframe(cm); st.dataframe(rep)
+            k,_,_=evaluate(x[x.Relevansi.eq('Relevan')]); st.write('Kappa sebelum adjudikasi (relevan):'); st.dataframe(k[k.Metrik.eq('Cohen Kappa')],hide_index=True)
+        with st.expander('Reset label uji coba (opsional, tindakan destruktif)'):
+            st.warning('Menghapus seluruh label Coder 1, Coder 2, dan adjudikasi proyek ini, bukan komentar. Hanya gunakan bila semua label adalah latihan; jangan gunakan jika ada penilaian ilmiah yang sah.')
+            phrase=st.text_input('Ketik RESET LABEL UJI',key='pub_reset')
+            if st.button('Reset kedua label',disabled=phrase!='RESET LABEL UJI'):
+                st.session_state.data=d.assign(Coder_1=PENDING,Coder_2=PENDING); p['adjudication']={}; p['independent']=False; p['independent_basis']=''; p['checks']=[]; p['checks_basis']=''; save_pub(p,'Reset semua label coder dan adjudikasi oleh pemilik')
+    with tabs[1]:
+        st.subheader('Matriks tema hasil pengodean manusia'); st.caption('Satu komentar dapat memiliki beberapa tema, dipisahkan titik koma. N adalah komentar unik per tema; bukan pengganti interpretasi netnografi.')
+        matrix,ev=theme_matrix(scope); st.dataframe(matrix,hide_index=True)
+        if matrix.empty: st.info('Belum ada tema pada cakupan publikasi. Isi Tema_Peneliti pada menu 02 dan lengkapi validasi.')
+        else:
+            st.dataframe(ev[['Tema','ID_Bukti','ID','Kasus','Kode','Kategori','Komentar']],hide_index=True)
+            st.caption('ID panjang adalah ID stabil untuk pemetaan teori. Kode Cxxxxx hanya untuk tampilan.')
+            if st.checkbox('Ekspor matriks dan bukti diizinkan oleh etika, izin platform dan retensi',key='pub_theme_export'):
+                pub_csv(matrix,'Unduh matriks tema','matriks_tema.csv'); pub_csv(ev.drop(columns=['Komentar']),'Unduh indeks bukti tanpa teks','indeks_bukti.csv')
+        st.subheader('Matriks kandidat kode perilaku (eksplorasi)'); st.caption('Hasil aturan kata kunci pada seluruh dataset; bukan label manusia dan bukan temuan final.')
+        st.dataframe(candidate_matrix(d),hide_index=True)
+    with tabs[2]:
+        st.subheader('Perbandingan antarkasus'); st.caption('Hanya cakupan publikasi yang telah dikonfirmasi. N tiap kasus menjadi denominator sendiri.')
+        if scope.empty: st.info('Belum ada cakupan publikasi.')
+        else:
+            cross=pub_cross(scope); st.dataframe(cross,hide_index=True)
+            count=scope.Label_Referensi.value_counts().reindex(LABELS,fill_value=0).rename_axis('Sentimen').reset_index(name='Jumlah')
+            st.plotly_chart(px.bar(count,x='Sentimen',y='Jumlah',color='Sentimen',color_discrete_map=COLORS))
+            long=cross.melt(id_vars=['Kasus','Total'],value_vars=LABELS,var_name='Sentimen',value_name='Jumlah'); long['Persen']=100*long.Jumlah/long.Total
+            st.plotly_chart(px.bar(long,x='Kasus',y='Persen',color='Sentimen',color_discrete_map=COLORS,barmode='stack'))
+            freq=st.radio('Periode (UTC)',['Hari','Minggu','Bulan'],horizontal=True); trend,missing=trend_table(scope,'Label_Referensi',{'Hari':'D','Minggu':'W','Bulan':'M'}[freq]); st.caption(f'Waktu komentar tidak valid/tidak tersedia: {missing}. Tren mengikuti waktu komentar pada sampel, bukan waktu koleksi atau perubahan kunjungan. Periode tanpa komentar tidak diisi nol.')
+            if not trend.empty: st.plotly_chart(px.line(trend,x='Periode_UTC',y='Persen',color='Sentimen',color_discrete_map=COLORS,markers=True,hover_data=['Jumlah','N_periode'])); st.dataframe(trend,hide_index=True)
+            if st.checkbox('Ekspor statistik/grafik diizinkan',key='pub_graph_export'):
+                pub_csv(cross,'Unduh tabel antarkasus','antarkasus_publikasi.csv'); pub_csv(trend,'Unduh tren','tren_publikasi.csv')
+                st.download_button('Unduh grafik sentimen PNG (300 dpi)',chart_png(count,'sentiment'),'sentimen_300dpi.png',mime='image/png')
+                if len(cross)<=30: st.download_button('Unduh grafik antarkasus PNG (300 dpi)',chart_png(cross,'cross'),'antarkasus_300dpi.png',mime='image/png')
+                else: st.info('Grafik PNG antarkasus dibatasi 30 kasus demi keterbacaan; gunakan CSV.')
+    with tabs[3]:
+        st.subheader('Pemetaan kandidat perilaku konsumen'); st.caption('Aturan lokal, bukan pengukuran konstruk psikologis. Negasi, ironi dan objek perlu diperiksa. Tidak mengukur kunjungan aktual.')
+        t=candidate_matrix(d)
+        if not t.empty: st.plotly_chart(px.bar(t,x='N_komentar',y='Kode_kandidat',color='Kasus',orientation='h',barmode='group')); st.dataframe(t,hide_index=True)
+        else: st.info('Belum ada kode kandidat.')
+        st.caption('Topic modeling eksploratif TF-IDF/KMeans dan jaringan ko-kemunculan tersedia di menu 04. Tema ilmiah tetap ditetapkan melalui interpretasi peneliti.')
+
+
+def theory_page(d):
+    p=copy.deepcopy(st.session_state.publication); scope=human_scope(d,p)
+    st.header('Pemetaan teori & referensi'); st.caption('Tidak menggunakan OpenAI API. Tidak membuat sitasi, DOI atau research gap secara otomatis.')
+    tab1,tab2,tab3=st.tabs(['Referensi','Pemetaan teori','Kerangka konseptual'])
+    with tab1:
+        st.caption('Masukkan referensi dari artikel yang benar-benar dibaca. ID unik, misalnya R01. Isi penulis, judul, sumber (jurnal, volume, halaman), DOI/URL jika ada, lalu centang verifikasi setelah pemeriksaan sumber asli. Format APA dibantu, bukan diverifikasi sistem.')
+        with st.form('pub_refs'):
+            rows=pub_editor(p['references'],REF_COLS,'pub_refs_'+str(st.session_state.version))
+            if st.form_submit_button('Simpan referensi'):
+                p['references']=rows; save_pub(p,'Referensi diperbarui')
+        for rid,line in pub_reference_lines(p): st.write(rid+' · '+line)
+    with tab2:
+        st.caption('Gunakan ID bukti stabil (bukan Cxxxxx), pisahkan beberapa ID dengan titik koma. Referensi wajib dikonfirmasi sebelum pemetaan dinilai lengkap.')
+        matrix,ev=theme_matrix(scope); st.dataframe(matrix,hide_index=True)
+        if not ev.empty: st.dataframe(ev[['Tema','ID_Bukti','ID','Kasus']],hide_index=True)
+        with st.form('pub_map'):
+            rows=pub_editor(p['theory'],MAP_COLS,'pub_theory_'+str(st.session_state.version))
+            if st.form_submit_button('Simpan pemetaan teori'): p['theory']=rows; save_pub(p,'Pemetaan teori diperbarui')
+        st.caption('Research gap, novelty dan kontribusi merupakan argumentasi peneliti, bukan hasil pencocokan otomatis.')
+    with tab3:
+        st.caption('Masukkan hubungan konseptual yang diusulkan, bukan hubungan kausal yang telah terbukti. Gunakan ID stabil dari indeks bukti.')
+        with st.form('pub_edges'):
+            rows=pub_editor(p['edges'],EDGE_COLS,'pub_edges_'+str(st.session_state.version))
+            if st.form_submit_button('Simpan kerangka konseptual'): p['edges']=rows; save_pub(p,'Kerangka konseptual diperbarui')
+        edges=[r for r in p['edges'] if r.get('Dari') and r.get('Ke')]
+        if edges:
+            # Fixed node IDs, escaped labels: do not interpret user text as DOT code.
+            nodes=sorted({r[k] for r in edges for k in ('Dari','Ke')}); keys={n:f'n{i}' for i,n in enumerate(nodes)}
+            dot='digraph G { rankdir=LR; node [shape=box, style=rounded];\n'+'\n'.join(f'{keys[n]} [label={json.dumps(n,ensure_ascii=False)}];' for n in nodes)+'\n'+'\n'.join(f'{keys[r["Dari"]]} -> {keys[r["Ke"]]} [label={json.dumps(r.get("Hubungan_usulan", ""),ensure_ascii=False)},style=dashed];' for r in edges)+'\n}'
+            st.graphviz_chart(dot); st.caption('Garis putus-putus = hubungan konseptual yang diusulkan.')
+    issues=mapping_issues(p,scope)
+    if issues: st.warning('\n\n'.join(issues))
+    elif p['theory'] or p['edges']: st.success('Rujukan ID dan isian dasar cocok. Substansi teori dan bukti tetap harus diperiksa peneliti.')
+
+
+def manuscript_page(d,project):
+    p=copy.deepcopy(st.session_state.publication); scope=human_scope(d,p)
+    st.header('Draf artikel & Word'); st.caption('Template IMRaD + statistik terhitung. Bukan generator literatur, bukan jaminan penerimaan jurnal.')
+    st.subheader('Narasi hasil deskriptif (otomatis, tanpa API)')
+    for para in publication_findings(d,p): st.write(para)
+    with st.form('pub_manuscript'):
+        m={}
+        for key,label in PUB_TEXT_FIELDS.items():
+            m[key]=st.text_area(label,p['manuscript'].get(key,''),height=90 if key in ('title','authors','keywords') else 150,max_chars=50000,key='pub_text_'+key+'_'+str(st.session_state.version))
+        if st.form_submit_button('Simpan draf artikel'): p['manuscript']=m; save_pub(p,'Draf artikel diperbarui')
+    st.subheader('Checklist kesiapan publikasi (penilaian peneliti)')
+    basis=readiness_basis(d,p); valid=p['checks_basis']==basis
+    if p['checks'] and not valid: st.warning('Data atau naskah berubah. Checklist sebelumnya perlu dikonfirmasi kembali.')
+    with st.form('pub_checks'):
+        chosen=[label for i,label in enumerate(PUB_CHECKS) if st.checkbox(label,value=valid and label in p['checks'],key=f'pub_check_{i}_{basis[:12]}')]
+        if st.form_submit_button('Simpan checklist'): p['checks']=chosen; p['checks_basis']=basis; save_pub(p,'Checklist diperbarui')
+    st.progress(len(p['checks'])/len(PUB_CHECKS) if valid else 0); st.caption('Indikator kelengkapan administratif yang dilaporkan sendiri, bukan skor Scopus.')
+    issues=mapping_issues(p,scope)
+    if issues: st.warning('Ada pemetaan teori/kerangka yang belum lengkap. Periksa menu 11.')
+    if scope.empty: st.warning('Cakupan publikasi kosong. Word tetap dapat dibuat sebagai template draf; tidak menghasilkan temuan final palsu.')
+    st.caption('Ekspor Word tidak menyalin komentar mentah secara otomatis. Teks yang dimasukkan sendiri ke draf tetap harus diperiksa anonimitas, izin, dan retensi.')
+    allowed=st.checkbox('Saya diizinkan mengekspor naskah dan statistik ini serta memahami batas retensi.',key='pub_doc_export')
+    index=st.checkbox('Sertakan indeks bukti (tanpa teks komentar, maksimal 100 baris)',value=False)
+    if allowed:
+        try: st.download_button('Unduh draf artikel Word (.docx)',publication_docx(d,p,project,index),'NetnoSense_PRO_8_draf_artikel.docx',mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document',type='primary')
+        except ImportError: st.error('Library python-docx belum terpasang. Perbarui requirements.txt.')
+
+
+st.set_page_config(page_title='NetnoSense PRO 8.0',page_icon='📊',layout='wide')
 st.markdown("""<style>[data-testid='stSidebar']{background: #f0f4fa;} div[data-testid='stMetric']{border:1px solid #d7e0eb;border-radius:12px;padding:14px;} .block-container{padding-top:2rem;} </style>""",unsafe_allow_html=True)
-st.title('NetnoSense PRO 7.0')
-st.caption('COLLABORATIVE RESEARCH PLATFORM  /  Digital consumer behavior & netnography')
+st.title('NetnoSense PRO 8.0')
+st.caption('SCIENTIFIC PUBLICATION & RESEARCH INTELLIGENCE  /  Digital consumer behavior & netnography')
 cloud_gate()
 # Role-limited navigation; coder cannot access dashboard, model, backup or exports.
 with st.sidebar:
     project=st.session_state.project_name
     st.text_input('Nama penelitian',value=project,disabled=True)
     if st.session_state.cloud_role=='owner':
-        page=st.radio('Navigasi',['00 · Proyek & cadangan','01 · Koleksi data','02 · Validasi & coding','03 · Dashboard','04 · Tema & bahasa','05 · Evaluasi','06 · Ekspor','07 · Jurnal & codebook','08 · Scientific AI','09 · Tim & retensi'])
+        page=st.radio('Navigasi',['00 · Proyek & cadangan','01 · Koleksi data','02 · Validasi & coding','03 · Dashboard','04 · Tema & bahasa','05 · Evaluasi','06 · Ekspor','07 · Jurnal & codebook','08 · Scientific AI','09 · Tim & retensi','10 · Analisis publikasi','11 · Pemetaan teori & referensi','12 · Draf artikel & Word'])
     else:
         page='02 · Validasi & coding'; st.caption('Ruang coder independen — hanya label Anda yang dapat diubah.')
     st.metric('Komentar tersimpan',len(st.session_state.data))
     st.caption('Perubahan yang disimpan melalui tombol aplikasi masuk ke database. Jangan simpan data atau API key di GitHub.')
+if st.session_state.cloud_role!='owner' and not page.startswith('02'): st.error('Akses menu tidak diizinkan.'); st.stop()
 if page.startswith('00'):
     st.header('Proyek & cadangan cloud')
     st.success('Proyek terhubung ke database. Buka proyek yang sama setelah login kembali.')
     st.warning('Cadangan lokal berisi data penelitian. Simpan hanya selama diizinkan. Jangan unggah cadangan ke GitHub publik.')
-    st.download_button('Unduh cadangan proyek JSON',snapshot(project),'NetnoSense_7_project.json',mime='application/json')
-    f=st.file_uploader('Buka cadangan proyek 5.0 / 6.0 / 7.0',type=['json']); confirm=st.checkbox('Saya memiliki izin penyimpanan cloud dan setuju mengganti seluruh isi proyek dengan cadangan ini')
+    st.download_button('Unduh cadangan proyek JSON',snapshot(project),'NetnoSense_8_project.json',mime='application/json')
+    f=st.file_uploader('Buka cadangan proyek 5.0 / 6.0 / 7.0 / 8.0',type=['json']); confirm=st.checkbox('Saya memiliki izin penyimpanan cloud dan setuju mengganti seluruh isi proyek dengan cadangan ini')
     if st.button('Pulihkan proyek',disabled=not(f and confirm)):
         try:
             restored=decode_snapshot(f.getvalue())
@@ -724,6 +1141,16 @@ if page.startswith('01'):
     if st.session_state.collection_log: st.dataframe(pd.DataFrame(st.session_state.collection_log),hide_index=True)
     st.stop()
 
+# Publication pages can prepare a draft even before collecting any comments.
+if page[:2] in ('10','11','12'):
+    pd_pub=st.session_state.data.copy()
+    if pd_pub.empty:
+        pd_pub=pd.DataFrame(columns=['ID','Komentar','Kasus','Relevansi','Coder_1','Coder_2','Sentimen_AI','Tema_Peneliti','Kategori_Peneliti','Kode_Peneliti','Kode_Saran'])
+    if page.startswith('10'): publication_analysis_page(pd_pub)
+    elif page.startswith('11'): theory_page(pd_pub)
+    else: manuscript_page(pd_pub,project)
+    st.stop()
+
 if st.session_state.data.empty: st.info('Belum ada data. Buka menu 01 · Koleksi data.'); st.stop()
 d=st.session_state.data.copy(); aspects=st.session_state.aspects.copy()
 if page.startswith('08'):
@@ -829,7 +1256,7 @@ elif page.startswith('04'):
         except ValueError as e: st.warning(str(e))
     st.subheader('Tema yang ditetapkan peneliti'); st.dataframe(counts_of(scope.Tema_Peneliti),hide_index=True)
 elif page.startswith('05'):
-    st.header('Evaluasi model & reliabilitas'); st.caption('Evaluasi model dasar tiga kelas, bukan saran campuran. Gunakan label independen. N evaluasi dapat berbeda dari N proyek; pasangan Kappa mencakup lima kelas.')
+    st.header('Evaluasi model & reliabilitas'); st.caption('Evaluasi awal model dasar tiga kelas terhadap Coder 1, bukan saran campuran. Gunakan label independen. Untuk referensi hasil adjudikasi, buka menu 10. N evaluasi dapat berbeda dari N proyek; pasangan Kappa mencakup lima kelas.')
     if metrics.empty: st.info('Isi Coder 1 dan Coder 2 di menu 02.')
     else: st.dataframe(metrics,hide_index=True)
     sem=pd.DataFrame(st.session_state.semantic)
@@ -841,11 +1268,13 @@ elif page.startswith('05'):
             st.dataframe(pd.DataFrame([{'Model':name,'N':len(paired),'Accuracy':(paired.Coder_1==paired[col]).mean(),'Macro F1':f1_score(paired.Coder_1,paired[col],labels=LABELS[:3],average='macro',zero_division=0)} for name,col in [('RoBERTa','Sentimen_AI'),('Semantik','sentimen')]]),hide_index=True)
     if not cm.empty: st.subheader('Confusion matrix (baris: manusia, kolom: AI)'); st.dataframe(cm); st.dataframe(report)
 else:
-    st.header('Pusat ekspor'); st.download_button('Cadangan proyek JSON',snapshot(project),'NetnoSense_7_project.json',mime='application/json'); st.caption('Ekspor mencakup dataset lengkap dan ringkasan sesuai cakupan yang dipilih. Pastikan data telah dianonimkan sesuai etika dan ketentuan API sebelum disimpan atau dibagikan.')
+    st.header('Pusat ekspor'); st.download_button('Cadangan proyek JSON',snapshot(project),'NetnoSense_8_project.json',mime='application/json'); st.caption('Ekspor mencakup dataset lengkap dan ringkasan sesuai cakupan yang dipilih. Pastikan data telah dianonimkan sesuai etika dan ketentuan API sebelum disimpan atau dibagikan.')
     tables={'Dataset':d,'Cakupan':scope,'Ringkasan':summary,'Antarkasus':cross,'Aspek':a,'Perilaku':behavior_counts,'Emosi':emotion_counts,'Unigram':freqs[1],'Bigram':freqs[2],'Trigram':freqs[3],'Evaluasi':metrics,'Confusion_matrix':cm.reset_index(),'Metrik_per_kelas':report.reset_index(),'Log_koleksi':pd.DataFrame(st.session_state.collection_log),'Jurnal':pd.DataFrame(st.session_state.journal),'Codebook':pd.DataFrame(st.session_state.codebook),'Audit':pd.DataFrame(st.session_state.audit),'Antrean':st.session_state.raw,'AI_semantik':pd.DataFrame(st.session_state.semantic),'Evidence_mapping':pd.DataFrame(st.session_state.semantic).merge(d[['ID','Kasus','Komentar']],on='ID',how='inner') if st.session_state.semantic else pd.DataFrame()}
+    p=st.session_state.publication; full=publication_data(st.session_state.data,p); hs=human_scope(st.session_state.data,p); tm,ev=theme_matrix(hs); pm,pcm,prep=reference_metrics(hs)
+    tables.update({'Publikasi_cakupan':pub_flow(st.session_state.data,p),'Referensi_manusia':full[['ID','Kode_Bukti','Kasus','Relevansi','Coder_1','Coder_2','Label_Referensi','Status_Referensi']], 'Publikasi_antarkasus':pub_cross(hs),'Matriks_tema':tm,'Indeks_bukti':ev.drop(columns=['Komentar']),'Evaluasi_referensi':pm,'CM_referensi':pcm.reset_index(),'Metrik_referensi':prep.reset_index(),'Teori':pd.DataFrame(p['theory']),'Kerangka':pd.DataFrame(p['edges']),'Referensi':pd.DataFrame(p['references']),'Adjudikasi':pd.DataFrame([{'ID':k,**v} for k,v in p['adjudication'].items()])})
     buf=io.BytesIO()
     with pd.ExcelWriter(buf,engine='openpyxl') as writer:
         for name,table in tables.items(): table.map(safe_cell).to_excel(writer,sheet_name=name,index=False)
-    st.download_button('Unduh seluruh hasil Excel',buf.getvalue(),'NetnoSense_PRO_7.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-    text='NETNOSENSE PRO 7.0 — LAPORAN DESKRIPTIF\n'+f'Proyek: {project}\nCakupan: {filter_mode}\nN: {len(scope)} / {len(d)}\n'+summary.to_string(index=False)+'\n\n'+cross.to_string(index=False)+'\n\nMetrik model:\n'+metrics.to_string(index=False)+'\n\nBatasan: prediksi dan pengodean otomatis bersifat sementara. Komentar tidak membuktikan perubahan kunjungan atau hubungan kausal.'
-    st.download_button('Unduh laporan TXT',text.encode('utf-8'),'laporan_v7.txt'); st.text(text)
+    st.download_button('Unduh seluruh hasil Excel',buf.getvalue(),'NetnoSense_PRO_8.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    text='NETNOSENSE PRO 8.0 — LAPORAN DESKRIPTIF\n'+f'Proyek: {project}\nCakupan: {filter_mode}\nN: {len(scope)} / {len(d)}\n'+summary.to_string(index=False)+'\n\n'+cross.to_string(index=False)+'\n\nMetrik model:\n'+metrics.to_string(index=False)+'\n\nBatasan: prediksi dan pengodean otomatis bersifat sementara. Komentar tidak membuktikan perubahan kunjungan atau hubungan kausal.'
+    st.download_button('Unduh laporan TXT',text.encode('utf-8'),'laporan_v8.txt'); st.text(text)
