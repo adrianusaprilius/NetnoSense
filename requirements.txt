@@ -9,3 +9,5 @@ requests
 wordcloud
 
 Sastrawi==1.0.1
+
+psycopg[binary]>=3.2,<4
