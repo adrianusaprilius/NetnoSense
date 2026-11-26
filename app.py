@@ -1,4 +1,5 @@
 import io, re
+import journal9
 import requests
 from urllib.parse import urlparse, parse_qs
 from datetime import datetime, timezone
@@ -204,12 +205,12 @@ def records(frame):
 
 def snapshot(project):
     q=st.session_state
-    obj={'schema':8,'publication':q.get('publication',publication_defaults()),'semantic':q.semantic,'project':project,'data':records(q.data),'aspects':records(q.aspects),'raw':records(q.raw),'collection_log':q.collection_log,'journal':q.journal,'codebook':q.codebook,'audit':q.audit,'stopwords':q.stopwords,'stemming':q.stemming,'raw_mode':q.raw_mode,'raw_registry':q.raw_registry,'batch_hashes':list(q.batch_hashes)}
+    obj={'schema':9,'journal9':q.get('journal9',journal9.defaults()),'publication':q.get('publication',publication_defaults()),'semantic':q.semantic,'project':project,'data':records(q.data),'aspects':records(q.aspects),'raw':records(q.raw),'collection_log':q.collection_log,'journal':q.journal,'codebook':q.codebook,'audit':q.audit,'stopwords':q.stopwords,'stemming':q.stemming,'raw_mode':q.raw_mode,'raw_registry':q.raw_registry,'batch_hashes':list(q.batch_hashes)}
     return json.dumps(obj,ensure_ascii=False,allow_nan=False).encode('utf-8')
 
 def decode_snapshot(blob):
     obj=json.loads(blob)
-    if not isinstance(obj,dict) or obj.get('schema') not in (5,6,7,8): raise ValueError('Gunakan cadangan JSON NetnoSense 5.0, 6.0, 7.0 atau 8.0.')
+    if not isinstance(obj,dict) or obj.get('schema') not in (5,6,7,8,9): raise ValueError('Gunakan cadangan JSON NetnoSense 5.0–9.0.')
     if not isinstance(obj.get('project'),str) or not obj['project'].strip(): raise ValueError('Nama proyek tidak valid.')
     out={}
     for k in ('data','aspects','raw'):
@@ -232,6 +233,7 @@ def decode_snapshot(blob):
     if len({r['ID'] for r in sem})!=len(sem) or any(r['ID'] not in set(d.get('ID',[])) for r in sem): raise ValueError('ID semantik tidak cocok.')
     out['semantic']=sem
     out['publication']=decode_publication(obj.get('publication',{}))
+    out['journal9']=journal9.decode(obj.get('journal9',{}))
     return out
 
 @st.cache_resource
@@ -362,7 +364,7 @@ def db():
     return psycopg.connect(dsn,connect_timeout=10,sslmode=mode,prepare_threshold=None)
 
 def empty_payload(name):
-    return {'schema':8,'publication':publication_defaults(),'project':name,'data':[],'aspects':[],'raw':[],'collection_log':[],'journal':[],'codebook':[],'audit':[], 'stopwords':DEFAULTS['stopwords'],'stemming':False,'raw_mode':'','raw_registry':{},'batch_hashes':[],'semantic':[]}
+    return {'schema':9,'journal9':journal9.defaults(),'publication':publication_defaults(),'project':name,'data':[],'aspects':[],'raw':[],'collection_log':[],'journal':[],'codebook':[],'audit':[], 'stopwords':DEFAULTS['stopwords'],'stemming':False,'raw_mode':'','raw_registry':{},'batch_hashes':[],'semantic':[]}
 
 def access_role(cur,pid,user,lock=False):
     # Serialize writes and membership changes on the parent row.
@@ -502,7 +504,7 @@ def login_signature(token): return hashlib.sha256(token.encode()).hexdigest()
 def cloud_gate():
     q=st.session_state; cfg=settings()
     if not cfg:
-        st.header('Konfigurasi NetnoSense PRO 8.0'); st.info('Database dan akun belum dikonfigurasi. Ikuti PANDUAN.txt: jalankan database.sql di Supabase, lalu masukkan konfigurasi ke Streamlit Secrets. Tidak ada data penelitian yang dibuka sebelum login.'); st.stop()
+        st.header('Konfigurasi NetnoSense PRO 9.0'); st.info('Database dan akun belum dikonfigurasi. Ikuti PANDUAN.txt: jalankan database.sql di Supabase, lalu masukkan konfigurasi ke Streamlit Secrets. Tidak ada data penelitian yang dibuka sebelum login.'); st.stop()
     _,admin,accounts=cfg
     if q.get('cloud_user') not in accounts or not hmac.compare_digest(str(q.get('cloud_signature','')),login_signature(accounts.get(q.get('cloud_user'),''))):
         if q.get('cloud_user'): clear_workspace(False)
@@ -532,7 +534,7 @@ def cloud_gate():
         if q.get('cloud_dirty'):
             st.warning('Perubahan lokal belum tersimpan. Simpan ulang bila memungkinkan atau muat ulang setelah mencadangkan perubahan.')
             if q.get('cloud_message'): st.error(q.cloud_message)
-            if role=='owner' and q.get('cloud_dirty'): st.download_button('Unduh cadangan lokal sebelum memuat ulang',snapshot(q.project_name),'recovery_8.json',mime='application/json')
+            if role=='owner' and q.get('cloud_dirty'): st.download_button('Unduh cadangan lokal sebelum memuat ulang',snapshot(q.project_name),'recovery_9.json',mime='application/json')
             if role!='owner':
                 col={'coder1':'Coder_1','coder2':'Coder_2'}[role]; st.download_button('Unduh label lokal Anda (CSV)',q.data[['ID',col]].map(safe_cell).to_csv(index=False).encode('utf-8-sig'),'label_lokal.csv')
             if (rev==q.cloud_revision or role!='owner') and st.button('Coba simpan lagi'):
@@ -989,21 +991,38 @@ def manuscript_page(d,project):
     allowed=st.checkbox('Saya diizinkan mengekspor naskah dan statistik ini serta memahami batas retensi.',key='pub_doc_export')
     index=st.checkbox('Sertakan indeks bukti (tanpa teks komentar, maksimal 100 baris)',value=False)
     if allowed:
-        try: st.download_button('Unduh draf artikel Word (.docx)',publication_docx(d,p,project,index),'NetnoSense_PRO_8_draf_artikel.docx',mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document',type='primary')
+        try: st.download_button('Unduh draf artikel Word (.docx)',publication_docx(d,p,project,index),'NetnoSense_PRO_9_draf_artikel.docx',mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document',type='primary')
         except ImportError: st.error('Library python-docx belum terpasang. Perbarui requirements.txt.')
 
 
-st.set_page_config(page_title='NetnoSense PRO 8.0',page_icon='📊',layout='wide')
+# V9 publication tools: same role gate, same save/retention/conflict path.
+def save_journal9(value, manuscript, action):
+    if st.session_state.cloud_role!='owner': st.error('Hanya pemilik proyek.'); st.stop()
+    try:
+        new=journal9.decode(value)
+        p=copy.deepcopy(st.session_state.publication)
+        if manuscript is not None:
+            p['manuscript']=manuscript
+        p=decode_publication(p)
+        st.session_state.journal9=new
+        st.session_state.publication=p
+        audit('Publikasi v9',action)
+        st.session_state.version+=1
+        st.rerun()
+    except ValueError as e:
+        st.error(str(e))
+
+st.set_page_config(page_title='NetnoSense PRO 9.0',page_icon='📊',layout='wide')
 st.markdown("""<style>[data-testid='stSidebar']{background: #f0f4fa;} div[data-testid='stMetric']{border:1px solid #d7e0eb;border-radius:12px;padding:14px;} .block-container{padding-top:2rem;} </style>""",unsafe_allow_html=True)
-st.title('NetnoSense PRO 8.0')
-st.caption('SCIENTIFIC PUBLICATION & RESEARCH INTELLIGENCE  /  Digital consumer behavior & netnography')
+st.title('NetnoSense PRO 9.0')
+st.caption('AUTOMATED SCIENTIFIC MANUSCRIPT & JOURNAL TEMPLATE INTELLIGENCE  /  Digital consumer behavior & netnography')
 cloud_gate()
 # Role-limited navigation; coder cannot access dashboard, model, backup or exports.
 with st.sidebar:
     project=st.session_state.project_name
     st.text_input('Nama penelitian',value=project,disabled=True)
     if st.session_state.cloud_role=='owner':
-        page=st.radio('Navigasi',['00 · Proyek & cadangan','01 · Koleksi data','02 · Validasi & coding','03 · Dashboard','04 · Tema & bahasa','05 · Evaluasi','06 · Ekspor','07 · Jurnal & codebook','08 · Scientific AI','09 · Tim & retensi','10 · Analisis publikasi','11 · Pemetaan teori & referensi','12 · Draf artikel & Word'])
+        page=st.radio('Navigasi',['00 · Proyek & cadangan','01 · Koleksi data','02 · Validasi & coding','03 · Dashboard','04 · Tema & bahasa','05 · Evaluasi','06 · Ekspor','07 · Jurnal & codebook','08 · Scientific AI','09 · Tim & retensi','10 · Analisis publikasi','11 · Pemetaan teori & referensi','12 · Draf artikel & Word','13 · Journal Finder','14 · Journal Template Intelligence','15 · Automatic Manuscript Builder','16 · Scientific Reference & Citation','17 · Scientific Reviewer Engine','18 · Journal Compliance Checker','19 · Submission Package','20 · Manuscript Version History'])
     else:
         page='02 · Validasi & coding'; st.caption('Ruang coder independen — hanya label Anda yang dapat diubah.')
     st.metric('Komentar tersimpan',len(st.session_state.data))
@@ -1013,8 +1032,8 @@ if page.startswith('00'):
     st.header('Proyek & cadangan cloud')
     st.success('Proyek terhubung ke database. Buka proyek yang sama setelah login kembali.')
     st.warning('Cadangan lokal berisi data penelitian. Simpan hanya selama diizinkan. Jangan unggah cadangan ke GitHub publik.')
-    st.download_button('Unduh cadangan proyek JSON',snapshot(project),'NetnoSense_8_project.json',mime='application/json')
-    f=st.file_uploader('Buka cadangan proyek 5.0 / 6.0 / 7.0 / 8.0',type=['json']); confirm=st.checkbox('Saya memiliki izin penyimpanan cloud dan setuju mengganti seluruh isi proyek dengan cadangan ini')
+    st.download_button('Unduh cadangan proyek JSON',snapshot(project),'NetnoSense_9_project.json',mime='application/json')
+    f=st.file_uploader('Buka cadangan proyek 5.0 / 6.0 / 7.0 / 8.0 / 9.0',type=['json']); confirm=st.checkbox('Saya memiliki izin penyimpanan cloud dan setuju mengganti seluruh isi proyek dengan cadangan ini')
     if st.button('Pulihkan proyek',disabled=not(f and confirm)):
         try:
             restored=decode_snapshot(f.getvalue())
@@ -1139,6 +1158,17 @@ if page.startswith('01'):
     st.caption('Log adalah riwayat permintaan, bukan jumlah unik. Analisis & tambahkan diperlukan untuk memindahkan antrean ke dataset.')
     if not st.session_state.data.empty: st.dataframe(st.session_state.data.groupby(['Sumber','Kasus']).size().reset_index(name='Tersimpan'),hide_index=True)
     if st.session_state.collection_log: st.dataframe(pd.DataFrame(st.session_state.collection_log),hide_index=True)
+    st.stop()
+
+if page[:2] in ('13','14','15','16','17','18','19','20'):
+    pd_pub=st.session_state.data.copy()
+    if pd_pub.empty:
+        pd_pub=pd.DataFrame(columns=['ID','Komentar','Kasus','Relevansi','Coder_1','Coder_2','Sentimen_AI','Tema_Peneliti','Kategori_Peneliti','Kode_Peneliti','Kode_Saran'])
+    journal9.page(st,int(page[:2]),pd_pub,st.session_state.publication,{
+        'save':save_journal9,'scope':human_scope,'themes':theme_matrix,'metrics':reference_metrics,
+        'cross':pub_cross,'narrative':publication_findings,'readiness':readiness_basis,
+        'mapping':mapping_issues,'fields':PUB_TEXT_FIELDS,'check_count':len(PUB_CHECKS),
+        'figure':chart_png,'records':records})
     st.stop()
 
 # Publication pages can prepare a draft even before collecting any comments.
@@ -1268,13 +1298,13 @@ elif page.startswith('05'):
             st.dataframe(pd.DataFrame([{'Model':name,'N':len(paired),'Accuracy':(paired.Coder_1==paired[col]).mean(),'Macro F1':f1_score(paired.Coder_1,paired[col],labels=LABELS[:3],average='macro',zero_division=0)} for name,col in [('RoBERTa','Sentimen_AI'),('Semantik','sentimen')]]),hide_index=True)
     if not cm.empty: st.subheader('Confusion matrix (baris: manusia, kolom: AI)'); st.dataframe(cm); st.dataframe(report)
 else:
-    st.header('Pusat ekspor'); st.download_button('Cadangan proyek JSON',snapshot(project),'NetnoSense_8_project.json',mime='application/json'); st.caption('Ekspor mencakup dataset lengkap dan ringkasan sesuai cakupan yang dipilih. Pastikan data telah dianonimkan sesuai etika dan ketentuan API sebelum disimpan atau dibagikan.')
+    st.header('Pusat ekspor'); st.download_button('Cadangan proyek JSON',snapshot(project),'NetnoSense_9_project.json',mime='application/json'); st.caption('Ekspor mencakup dataset lengkap dan ringkasan sesuai cakupan yang dipilih. Pastikan data telah dianonimkan sesuai etika dan ketentuan API sebelum disimpan atau dibagikan.')
     tables={'Dataset':d,'Cakupan':scope,'Ringkasan':summary,'Antarkasus':cross,'Aspek':a,'Perilaku':behavior_counts,'Emosi':emotion_counts,'Unigram':freqs[1],'Bigram':freqs[2],'Trigram':freqs[3],'Evaluasi':metrics,'Confusion_matrix':cm.reset_index(),'Metrik_per_kelas':report.reset_index(),'Log_koleksi':pd.DataFrame(st.session_state.collection_log),'Jurnal':pd.DataFrame(st.session_state.journal),'Codebook':pd.DataFrame(st.session_state.codebook),'Audit':pd.DataFrame(st.session_state.audit),'Antrean':st.session_state.raw,'AI_semantik':pd.DataFrame(st.session_state.semantic),'Evidence_mapping':pd.DataFrame(st.session_state.semantic).merge(d[['ID','Kasus','Komentar']],on='ID',how='inner') if st.session_state.semantic else pd.DataFrame()}
     p=st.session_state.publication; full=publication_data(st.session_state.data,p); hs=human_scope(st.session_state.data,p); tm,ev=theme_matrix(hs); pm,pcm,prep=reference_metrics(hs)
     tables.update({'Publikasi_cakupan':pub_flow(st.session_state.data,p),'Referensi_manusia':full[['ID','Kode_Bukti','Kasus','Relevansi','Coder_1','Coder_2','Label_Referensi','Status_Referensi']], 'Publikasi_antarkasus':pub_cross(hs),'Matriks_tema':tm,'Indeks_bukti':ev.drop(columns=['Komentar']),'Evaluasi_referensi':pm,'CM_referensi':pcm.reset_index(),'Metrik_referensi':prep.reset_index(),'Teori':pd.DataFrame(p['theory']),'Kerangka':pd.DataFrame(p['edges']),'Referensi':pd.DataFrame(p['references']),'Adjudikasi':pd.DataFrame([{'ID':k,**v} for k,v in p['adjudication'].items()])})
     buf=io.BytesIO()
     with pd.ExcelWriter(buf,engine='openpyxl') as writer:
         for name,table in tables.items(): table.map(safe_cell).to_excel(writer,sheet_name=name,index=False)
-    st.download_button('Unduh seluruh hasil Excel',buf.getvalue(),'NetnoSense_PRO_8.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-    text='NETNOSENSE PRO 8.0 — LAPORAN DESKRIPTIF\n'+f'Proyek: {project}\nCakupan: {filter_mode}\nN: {len(scope)} / {len(d)}\n'+summary.to_string(index=False)+'\n\n'+cross.to_string(index=False)+'\n\nMetrik model:\n'+metrics.to_string(index=False)+'\n\nBatasan: prediksi dan pengodean otomatis bersifat sementara. Komentar tidak membuktikan perubahan kunjungan atau hubungan kausal.'
+    st.download_button('Unduh seluruh hasil Excel',buf.getvalue(),'NetnoSense_PRO_9.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    text='NETNOSENSE PRO 9.0 — LAPORAN DESKRIPTIF\n'+f'Proyek: {project}\nCakupan: {filter_mode}\nN: {len(scope)} / {len(d)}\n'+summary.to_string(index=False)+'\n\n'+cross.to_string(index=False)+'\n\nMetrik model:\n'+metrics.to_string(index=False)+'\n\nBatasan: prediksi dan pengodean otomatis bersifat sementara. Komentar tidak membuktikan perubahan kunjungan atau hubungan kausal.'
     st.download_button('Unduh laporan TXT',text.encode('utf-8'),'laporan_v8.txt'); st.text(text)
